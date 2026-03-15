@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"pigeon/internal/agent"
+	"pigeon/internal/config"
 	luaext "pigeon/internal/extensions/lua"
 	"pigeon/internal/provider/openrouter"
 	"pigeon/internal/resources"
@@ -44,7 +45,7 @@ func newModelWithSessions(t *testing.T) (Model, *session.Manager, string) {
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	m := NewModel(nil, nil, "test-model", mgr, id, nil, nil, nil)
+	m := NewModel(nil, nil, "test-model", mgr, id, nil, nil, nil, config.Settings{})
 	return m, mgr, id
 }
 
@@ -91,7 +92,7 @@ func TestInit_WithRuntime(t *testing.T) {
 	defer rt.Close()
 	rt.LoadString("t", `pigeon.on("session_start", function() pigeon.set_status("x","fired") end)`)
 
-	m := NewModel(nil, nil, "m", nil, "", nil, rt, ch)
+	m := NewModel(nil, nil, "m", nil, "", nil, rt, ch, config.Settings{})
 	cmd := m.Init()
 	if cmd == nil {
 		t.Error("Init with runtime should return a batch cmd")
@@ -345,7 +346,7 @@ func TestUpdateChat_ExtCommandDone_WithError(t *testing.T) {
 // ── submitPrompt ──────────────────────────────────────────────────────────────
 
 func TestSubmitPrompt_SetsRunning(t *testing.T) {
-	m := NewModel(&fakeAgent{response: "hello"}, nil, "test-model", nil, "", nil, nil, nil)
+	m := NewModel(&fakeAgent{response: "hello"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{})
 	next, cmd := m.submitPrompt("say hello")
 	tm := next.(Model)
 	if !tm.running {
@@ -357,7 +358,7 @@ func TestSubmitPrompt_SetsRunning(t *testing.T) {
 }
 
 func TestSubmitPrompt_AddsUserAndAssistantLines(t *testing.T) {
-	m := NewModel(&fakeAgent{response: "hello"}, nil, "test-model", nil, "", nil, nil, nil)
+	m := NewModel(&fakeAgent{response: "hello"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{})
 	next, cmd := m.submitPrompt("say hello")
 	m = next.(Model)
 	m = streamedModel(t, m, cmd)
@@ -498,15 +499,8 @@ func TestHandleCommand_Tree_WithSession(t *testing.T) {
 
 	next, _ := m.handleCommand("/tree")
 	tm := next.(Model)
-	found := false
-	for _, l := range tm.lines {
-		if strings.Contains(l, "tree") || strings.Contains(l, "•") || strings.Contains(l, "└") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("expected tree output: %v", tm.lines)
+	if tm.mode != nodePickMode {
+		t.Errorf("expected nodePickMode after /tree, got mode=%d lines=%v", tm.mode, tm.lines)
 	}
 }
 
@@ -515,7 +509,7 @@ func TestHandleCommand_SkillWithRegistry(t *testing.T) {
 	writeFile(t, global+"/skills/py/SKILL.md", "be a python expert")
 	reg, _ := resources.LoadFrom(global, "")
 
-	m := NewModel(nil, nil, "m", nil, "", reg, nil, nil)
+	m := NewModel(nil, nil, "m", nil, "", reg, nil, nil, config.Settings{})
 	next, _ := m.handleCommand("/skill:py")
 	tm := next.(Model)
 	found := false
@@ -535,7 +529,7 @@ func TestHandleCommand_PromptExpansion(t *testing.T) {
 	writeFile(t, global+"/prompts/review.md", "Please review the following code:")
 	reg, _ := resources.LoadFrom(global, "")
 
-	m := NewModel(nil, nil, "m", nil, "", reg, nil, nil)
+	m := NewModel(nil, nil, "m", nil, "", reg, nil, nil, config.Settings{})
 	next, _ := m.handleCommand("/review")
 	tm := next.(Model)
 	if !strings.Contains(tm.input.Value(), "Please review") {
@@ -688,7 +682,7 @@ func TestRecalcViewport_ChromeIncludesSuggestions(t *testing.T) {
 }
 
 func TestAutoScroll_NewContentScrollsDown(t *testing.T) {
-	m := NewModel(&fakeAgent{response: "hello world"}, nil, "test-model", nil, "", nil, nil, nil)
+	m := NewModel(&fakeAgent{response: "hello world"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{})
 	m.autoScroll = true
 	next2, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = next2.(Model)
@@ -755,15 +749,60 @@ func TestHandleCommand_System_ShowCurrent(t *testing.T) {
 }
 
 func TestNewModel_SystemPromptVariadic(t *testing.T) {
-	m := NewModel(nil, nil, "model", nil, "", nil, nil, nil, "You are a pirate.")
+	m := NewModel(nil, nil, "model", nil, "", nil, nil, nil, config.Settings{}, "You are a pirate.")
 	if m.systemPrompt != "You are a pirate." {
 		t.Errorf("expected system prompt, got %q", m.systemPrompt)
 	}
 }
 
 func TestNewModel_NoSystemPrompt(t *testing.T) {
-	m := NewModel(nil, nil, "model", nil, "", nil, nil, nil)
+	m := NewModel(nil, nil, "model", nil, "", nil, nil, nil, config.Settings{})
 	if m.systemPrompt != "" {
 		t.Errorf("expected empty system prompt, got %q", m.systemPrompt)
 	}
+}
+
+// ── pruneCurrentSessionIfEmpty ────────────────────────────────────────────────
+
+func TestPruneCurrentSessionIfEmpty_DeletesEmptySession(t *testing.T) {
+	m, mgr, id := newModelWithSessions(t)
+
+	// Sanity: session exists before prune.
+	sessions, _ := mgr.ListSessions(0)
+	if len(sessions) != 1 {
+		t.Fatalf("expected 1 session before prune, got %d", len(sessions))
+	}
+
+	m.pruneCurrentSessionIfEmpty()
+
+	sessions, _ = mgr.ListSessions(0)
+	if len(sessions) != 0 {
+		t.Errorf("empty session should have been deleted, got %d remaining", len(sessions))
+	}
+	_ = id
+}
+
+func TestPruneCurrentSessionIfEmpty_KeepsSessionWithMessages(t *testing.T) {
+	m, mgr, id := newModelWithSessions(t)
+	mgr.AppendMessages(id, "", []openrouter.Message{{Role: "user", Content: "hello"}})
+
+	m.pruneCurrentSessionIfEmpty()
+
+	sessions, _ := mgr.ListSessions(0)
+	if len(sessions) != 1 {
+		t.Errorf("non-empty session should be kept, got %d remaining", len(sessions))
+	}
+}
+
+func TestPruneCurrentSessionIfEmpty_NoOpWhenNoStore(t *testing.T) {
+	m := newTestModel() // sessions == nil
+	// Should not panic.
+	m.pruneCurrentSessionIfEmpty()
+}
+
+func TestPruneCurrentSessionIfEmpty_NoOpWhenNoSessionID(t *testing.T) {
+	mgr := session.NewManager(t.TempDir())
+	m := NewModel(nil, nil, "test-model", mgr, "", nil, nil, nil, config.Settings{})
+	// Should not panic and should not delete anything.
+	m.pruneCurrentSessionIfEmpty()
 }

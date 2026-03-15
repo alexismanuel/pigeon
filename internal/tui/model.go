@@ -2,16 +2,21 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"pigeon/internal/agent"
+	"pigeon/internal/config"
 	luaext "pigeon/internal/extensions/lua"
 	"pigeon/internal/provider/openrouter"
 	"pigeon/internal/resources"
@@ -28,9 +33,10 @@ var (
 type appMode int
 
 const (
-	chatMode   appMode = iota
-	pickerMode appMode = iota
-	resumeMode appMode = iota
+	chatMode     appMode = iota
+	pickerMode   appMode = iota
+	resumeMode   appMode = iota
+	nodePickMode appMode = iota
 )
 
 type turnRunner interface {
@@ -50,6 +56,7 @@ type sessionStore interface {
 	SetSessionLabel(sessionID, label string) error
 	GetSessionLabel(sessionID string) (string, error)
 	GetFirstUserMessage(sessionID string) (string, error)
+	DeleteSession(sessionID string) error
 }
 
 type modelCatalog interface {
@@ -60,6 +67,16 @@ type modelCatalog interface {
 
 type tokenMsg struct {
 	token string
+}
+
+type thinkingTokenMsg struct {
+	token string
+}
+
+// thinkingBlock records a completed thinking block so it can be toggled.
+type thinkingBlock struct {
+	lineIdx int
+	content string
 }
 
 type toolCallMsg struct {
@@ -94,6 +111,7 @@ type Model struct {
 	mode          appMode
 	picker        picker
 	sessionPicker sessionPicker
+	nodePicker    nodePicker
 
 	sessionID     string
 	currentNodeID string
@@ -107,12 +125,23 @@ type Model struct {
 	lines            []string
 	streamCh         chan tea.Msg
 	running          bool
+	cancelTurn       context.CancelFunc // non-nil while a turn is in flight
 	width            int
 	height           int
 	assistantLineIdx int
+	thinkingLineIdx  int    // index of the streaming thinking block; -1 when none
+	thinkingContent  string // raw accumulated thinking text (reset each turn)
+	thinkingBlocks   []thinkingBlock // all finished thinking blocks this session
+	thinkingCollapsed bool           // current collapse state (toggled per-session)
+	spinner          spinner.Model
 
 	registry     *resources.Registry
 	resourceCmds []commandDef // dynamic commands built from registry + extension commands
+
+	mdRenderer  *glamour.TermRenderer // created once at init, before BubbleTea owns stdin
+	mdStyle     string                // "dark" or "light", detected at init
+
+	keybindings config.Keybindings
 
 	runtime  *luaext.Runtime
 	statusCh <-chan luaext.StatusUpdate
@@ -123,14 +152,15 @@ type Model struct {
 }
 
 var (
-	headerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
-	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	userStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
-	asstStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
-	metaStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
+	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	userStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
+	asstStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	metaStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	thinkingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
 )
 
-func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions sessionStore, sessionID string, reg *resources.Registry, rt *luaext.Runtime, statusCh <-chan luaext.StatusUpdate, systemPrompt ...string) Model {
+func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions sessionStore, sessionID string, reg *resources.Registry, rt *luaext.Runtime, statusCh <-chan luaext.StatusUpdate, settings config.Settings, systemPrompt ...string) Model {
 	in := textinput.New()
 	in.Placeholder = "Ask pigeon..."
 	in.Prompt = "> "
@@ -140,6 +170,20 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 
 	vp := viewport.New(0, 0)
 	vp.KeyMap = viewport.KeyMap{} // disable all keyboard bindings; mouse wheel only
+
+	// Detect dark/light style NOW, before BubbleTea takes over stdin.
+	// WithAutoStyle() sends an OSC 11 terminal query; if we did this later the
+	// terminal's response would be read by BubbleTea as keyboard input and
+	// appear verbatim in the text field.
+	mdStyle := glamourStyle()
+	mdRenderer, _ := glamour.NewTermRenderer(
+		glamour.WithStandardStyle(mdStyle),
+		glamour.WithWordWrap(80),
+	)
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 
 	m := Model{
 		agent:            ag,
@@ -151,7 +195,13 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 		vp:               vp,
 		autoScroll:       true,
 		lines:            introLines(strings.TrimSpace(sessionID), ""),
-		assistantLineIdx: -1,
+		assistantLineIdx:  -1,
+		thinkingLineIdx:   -1,
+		thinkingCollapsed: settings.CollapseThinking,
+		spinner:           sp,
+		mdRenderer:       mdRenderer,
+		mdStyle:          mdStyle,
+		keybindings:      settings.Keybindings,
 		registry:         reg,
 		runtime:          rt,
 		statusCh:         statusCh,
@@ -170,7 +220,7 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 			m.history = append([]openrouter.Message{}, messages...)
 			m.currentNodeID = nodeID
 			m.lines = introLines(m.sessionID, m.currentNodeID)
-			m.lines = append(m.lines, renderHistoryLines(messages)...)
+			m.lines = append(m.lines, m.renderHistoryLines(messages)...)
 		} else {
 			m.lines = append(m.lines, errorStyle.Render("failed to load initial session: "+err.Error()))
 		}
@@ -236,6 +286,14 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = ws.Width
 		m.height = ws.Height
 		m.input.Width = max(20, ws.Width-4)
+		// Rebuild glamour renderer with the new word-wrap width.
+		// Use WithStandardStyle (not WithAutoStyle) to avoid an OSC 11 query.
+		if r, err := glamour.NewTermRenderer(
+			glamour.WithStandardStyle(m.mdStyle),
+			glamour.WithWordWrap(m.width),
+		); err == nil {
+			m.mdRenderer = r
+		}
 		if m.mode == pickerMode {
 			var cmd tea.Cmd
 			m.picker, cmd = m.picker.Update(ws)
@@ -246,6 +304,11 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sessionPicker, cmd = m.sessionPicker.Update(ws)
 			return m, cmd
 		}
+		if m.mode == nodePickMode {
+			var cmd tea.Cmd
+			m.nodePicker, cmd = m.nodePicker.Update(ws)
+			return m, cmd
+		}
 		return m, nil
 	}
 
@@ -254,6 +317,9 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if m.mode == resumeMode {
 		return m.updateResumePicker(msg)
+	}
+	if m.mode == nodePickMode {
+		return m.updateNodePicker(msg)
 	}
 	return m.updateChat(msg)
 }
@@ -303,7 +369,7 @@ func (m Model) updateResumePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.modelName = savedModel
 		}
 		m.lines = introLines(m.sessionID, m.currentNodeID)
-		m.lines = append(m.lines, renderHistoryLines(messages)...)
+		m.lines = append(m.lines, m.renderHistoryLines(messages)...)
 		m.lines = append(m.lines, metaStyle.Render(fmt.Sprintf(
 			"Resumed session %s at node %s (%d messages)",
 			m.sessionID, shortID(m.currentNodeID), len(messages),
@@ -319,6 +385,42 @@ func (m Model) updateResumePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 	default:
 		var cmd tea.Cmd
 		m.sessionPicker, cmd = m.sessionPicker.Update(msg)
+		return m, cmd
+	}
+}
+
+func (m Model) updateNodePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case nodePickedMsg:
+		m.mode = chatMode
+		m.input.Focus()
+		if m.sessions == nil {
+			m.lines = append(m.lines, errorStyle.Render("session store not available"))
+			return m, textinput.Blink
+		}
+		messages, err := m.sessions.LoadMessagesAtNode(m.sessionID, msg.nodeID)
+		if err != nil {
+			m.lines = append(m.lines, errorStyle.Render("failed to load messages at node: "+err.Error()))
+			return m, textinput.Blink
+		}
+		m.currentNodeID = msg.nodeID
+		m.history = append([]openrouter.Message{}, messages...)
+		m.lines = introLines(m.sessionID, m.currentNodeID)
+		m.lines = append(m.lines, m.renderHistoryLines(messages)...)
+		m.lines = append(m.lines, metaStyle.Render(fmt.Sprintf(
+			"Checked out node %s (%d messages)",
+			shortID(m.currentNodeID), len(messages),
+		)))
+		return m, textinput.Blink
+
+	case nodePickCanceledMsg:
+		m.mode = chatMode
+		m.input.Focus()
+		return m, textinput.Blink
+
+	default:
+		var cmd tea.Cmd
+		m.nodePicker, cmd = m.nodePicker.Update(msg)
 		return m, cmd
 	}
 }
@@ -350,12 +452,33 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// ── normal chat keys ───────────────────────────────────────────────
-		switch msg.String() {
-		case "ctrl+c":
+		key := msg.String()
+		switch {
+		case key == m.keybindings.ClearInput:
+			// Clear the input field if it has content; otherwise no-op.
+			if m.input.Value() != "" {
+				m.input.SetValue("")
+				m.suggestions = nil
+				m.suggCursor = 0
+			}
+			return m, nil
+		case key == m.keybindings.Quit:
 			if m.runtime != nil {
 				m.runtime.Fire(luaext.Event{Kind: luaext.EventSessionShutdown}) //nolint
 			}
+			m.pruneCurrentSessionIfEmpty()
 			return m, tea.Quit
+		case key == m.keybindings.CancelTurn:
+			if m.running && m.cancelTurn != nil {
+				m.cancelTurn()
+				m.cancelTurn = nil
+			}
+			return m, nil
+		case key == m.keybindings.ToggleThinking:
+			m.toggleThinking()
+			return m, nil
+		}
+		switch key {
 		case "enter":
 			if m.running {
 				return m, nil
@@ -373,15 +496,32 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m.submitPrompt(value)
 		}
+	case spinner.TickMsg:
+		if m.running {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+	case thinkingTokenMsg:
+		if m.thinkingLineIdx < 0 {
+			m.lines = append(m.lines, "")
+			m.thinkingLineIdx = len(m.lines) - 1
+		}
+		m.thinkingContent += msg.token
+		m.lines[m.thinkingLineIdx] = thinkingLine(m.thinkingContent)
+		return m, waitForStream(m.streamCh)
 	case tokenMsg:
 		if m.assistantLineIdx < 0 {
-			// Start a new assistant line (happens after tool-call rounds).
+			// Start a new assistant line (first content token of this round).
 			m.lines = append(m.lines, assistantLine(""))
 			m.assistantLineIdx = len(m.lines) - 1
 		}
 		m.lines[m.assistantLineIdx] += msg.token
 		return m, waitForStream(m.streamCh)
 	case toolCallMsg:
+		// Thinking for this round is done — collapse it.
+		m.collapseThinkingLine()
 		// Reset so the follow-up assistant message starts on its own line.
 		m.assistantLineIdx = -1
 		m.lines = append(m.lines, metaStyle.Render(fmt.Sprintf("↳ tool call: %s(%s)", msg.name, msg.args)))
@@ -395,6 +535,11 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForStream(m.streamCh)
 	case turnDoneMsg:
 		m.running = false
+		if m.cancelTurn != nil {
+			m.cancelTurn()
+			m.cancelTurn = nil
+		}
+		m.collapseThinkingLine()
 		if len(msg.newMessages) > 0 {
 			m.history = append(m.history, msg.newMessages...)
 			if m.sessions != nil && m.sessionID != "" {
@@ -408,9 +553,8 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		finalAssistant := lastAssistantContent(msg.newMessages)
 		if m.assistantLineIdx >= 0 && m.assistantLineIdx < len(m.lines) {
-			prefix := assistantLine("")
-			if strings.TrimSpace(strings.TrimPrefix(m.lines[m.assistantLineIdx], prefix)) == "" && strings.TrimSpace(finalAssistant) != "" {
-				m.lines[m.assistantLineIdx] = assistantLine(finalAssistant)
+			if strings.TrimSpace(finalAssistant) != "" {
+				m.lines[m.assistantLineIdx] = renderAssistantMarkdown(m.mdRenderer, finalAssistant, m.width)
 			}
 		}
 		m.assistantLineIdx = -1
@@ -421,7 +565,16 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case turnErrMsg:
 		m.running = false
 		m.assistantLineIdx = -1
-		m.lines = append(m.lines, errorStyle.Render("Error: "+msg.err.Error()))
+		m.collapseThinkingLine()
+		if m.cancelTurn != nil {
+			m.cancelTurn()
+			m.cancelTurn = nil
+		}
+		if errors.Is(msg.err, context.Canceled) {
+			m.lines = append(m.lines, errorStyle.Render("Cancelled."))
+		} else {
+			m.lines = append(m.lines, errorStyle.Render("Error: "+msg.err.Error()))
+		}
 		return m, nil
 	case extCommandDoneMsg:
 		if msg.err != nil {
@@ -477,10 +630,13 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 	}
 
 	m.lines = append(m.lines, userLine(value))
-	m.lines = append(m.lines, assistantLine(""))
-	m.assistantLineIdx = len(m.lines) - 1
+	m.assistantLineIdx = -1
+	m.thinkingLineIdx = -1
+	m.thinkingContent = ""
 	m.running = true
 	m.streamCh = make(chan tea.Msg, 128)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelTurn = cancel
 	history := append([]openrouter.Message{}, m.history...)
 	// Prepend system prompt as first message each turn (not persisted to session).
 	if sp := strings.TrimSpace(m.systemPrompt); sp != "" {
@@ -488,10 +644,13 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 	}
 	rt := m.runtime // capture pointer; safe to call from agent goroutine
 
-	go func(ch chan<- tea.Msg, input, modelName string, hist []openrouter.Message) {
-		newMessages, err := m.agent.RunTurn(context.Background(), modelName, hist, input, agent.TurnCallbacks{
+	go func(ctx context.Context, ch chan<- tea.Msg, input, modelName string, hist []openrouter.Message) {
+		newMessages, err := m.agent.RunTurn(ctx, modelName, hist, input, agent.TurnCallbacks{
 			OnToken: func(token string) {
 				ch <- tokenMsg{token: token}
+			},
+			OnThinkingToken: func(token string) {
+				ch <- thinkingTokenMsg{token: token}
 			},
 			// BeforeToolCall fires EventToolCall synchronously in the agent goroutine
 			// so Lua handlers can block execution before it happens.
@@ -528,9 +687,9 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 		}
 		ch <- turnDoneMsg{newMessages: newMessages}
 		close(ch)
-	}(m.streamCh, value, m.modelName, history)
+	}(ctx, m.streamCh, value, m.modelName, history)
 
-	return m, waitForStream(m.streamCh)
+	return m, tea.Batch(waitForStream(m.streamCh), m.spinner.Tick)
 }
 
 func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
@@ -543,6 +702,7 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 		if m.runtime != nil {
 			m.runtime.Fire(luaext.Event{Kind: luaext.EventSessionShutdown}) //nolint
 		}
+		m.pruneCurrentSessionIfEmpty()
 		return m, tea.Quit
 
 	case "/model":
@@ -661,6 +821,29 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 		m.lines = append(m.lines, metaStyle.Render("System prompt updated."))
 		return m, nil
 
+	case "/keybinds":
+		kb := m.keybindings
+		entries := []struct{ key, action string }{
+			{kb.ClearInput, "clear input field"},
+			{kb.Quit, "quit pigeon"},
+			{kb.CancelTurn, "cancel running assistant turn"},
+			{kb.ToggleThinking, "toggle thinking blocks"},
+		}
+		// measure longest key for alignment
+		maxLen := 0
+		for _, e := range entries {
+			if len(e.key) > maxLen {
+				maxLen = len(e.key)
+			}
+		}
+		keyStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+		m.lines = append(m.lines, metaStyle.Render("Keybindings:"))
+		for _, e := range entries {
+			pad := strings.Repeat(" ", maxLen-len(e.key))
+			m.lines = append(m.lines, "  "+keyStyle.Render(e.key)+pad+"  "+e.action)
+		}
+		return m, nil
+
 	case "/tree":
 		if m.sessions == nil {
 			m.lines = append(m.lines, errorStyle.Render("Session store not available"))
@@ -679,9 +862,16 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			m.lines = append(m.lines, metaStyle.Render("Session tree is empty"))
 			return m, nil
 		}
-		m.lines = append(m.lines, metaStyle.Render("Session tree:"))
-		m.lines = append(m.lines, renderTree(nodes, m.currentNodeID)...)
-		m.lines = append(m.lines, metaStyle.Render("Resume from node: /resume <session-id> <node-id-prefix>"))
+		w, h := m.width, m.height
+		if w == 0 {
+			w = 120
+		}
+		if h == 0 {
+			h = 40
+		}
+		m.mode = nodePickMode
+		m.input.Blur()
+		m.nodePicker = newNodePicker(nodes, m.currentNodeID, w, h)
 		return m, nil
 
 	default:
@@ -744,6 +934,9 @@ func (m Model) View() string {
 	if m.mode == resumeMode {
 		return lipgloss.JoinVertical(lipgloss.Left, header, "", m.sessionPicker.View())
 	}
+	if m.mode == nodePickMode {
+		return lipgloss.JoinVertical(lipgloss.Left, header, "", m.nodePicker.View())
+	}
 	return m.viewChat(header)
 }
 
@@ -758,6 +951,9 @@ func (m Model) renderHeader() string {
 	if m.mode == resumeMode {
 		status = "picking session"
 	}
+	if m.mode == nodePickMode {
+		status = "picking node"
+	}
 	sessionText := "none"
 	if m.sessionID != "" {
 		sessionText = m.sessionID
@@ -770,17 +966,32 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) viewChat(header string) string {
-	// One reserved line between viewport and input shows scroll position when
-	// the user has scrolled up; blank otherwise so layout never jumps.
-	scrollLine := " "
-	if !m.vp.AtBottom() {
+	// One reserved line between viewport and input: spinner while running,
+	// scroll indicator when scrolled up, blank otherwise.
+	var statusLine string
+	if m.running {
+		spinnerView := m.spinner.View()
+		if !m.vp.AtBottom() {
+			below := m.vp.TotalLineCount() - m.vp.YOffset - m.vp.Height
+			if below > 0 {
+				statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more  ", below)) + spinnerView
+			} else {
+				statusLine = spinnerView
+			}
+		} else {
+			statusLine = spinnerView
+		}
+	} else if !m.vp.AtBottom() {
 		below := m.vp.TotalLineCount() - m.vp.YOffset - m.vp.Height
 		if below > 0 {
-			scrollLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more", below))
+			statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more", below))
 		}
 	}
+	if statusLine == "" {
+		statusLine = " " // keep layout height stable
+	}
 
-	parts := []string{header, "", m.vp.View(), scrollLine}
+	parts := []string{header, "", m.vp.View(), statusLine}
 	if len(m.suggestions) > 0 {
 		parts = append(parts, m.renderSuggestions())
 	}
@@ -852,6 +1063,19 @@ func (m Model) recalcViewport() Model {
 	return m
 }
 
+// pruneCurrentSessionIfEmpty deletes the active session when it has no user
+// messages (i.e. the user quit without sending anything).
+func (m *Model) pruneCurrentSessionIfEmpty() {
+	if m.sessions == nil || m.sessionID == "" {
+		return
+	}
+	first, err := m.sessions.GetFirstUserMessage(m.sessionID)
+	if err != nil || first != "" {
+		return
+	}
+	_ = m.sessions.DeleteSession(m.sessionID)
+}
+
 func waitForStream(ch <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		msg, ok := <-ch
@@ -873,8 +1097,72 @@ func introLines(sessionID, nodeID string) []string {
 	return lines
 }
 
-func userLine(content string) string    { return userStyle.Render("You:") + " " + content }
+// glamourStyle returns the glamour style name to use. It respects the
+// GLAMOUR_STYLE env var (e.g. "dark", "light", "dracula") and falls back to
+// "dark". We deliberately avoid WithAutoStyle() here because that sends an
+// OSC 11 terminal colour query; if that query fires after BubbleTea has taken
+// over stdin the terminal's response lands in the input field as garbage text.
+func glamourStyle() string {
+	if s := strings.TrimSpace(os.Getenv("GLAMOUR_STYLE")); s != "" {
+		return s
+	}
+	return "dark"
+}
+
+func userLine(content string) string { return userStyle.Render("You:") + " " + content }
+
+// thinkingLine renders streaming thinking/reasoning content in a dim italic style.
+func thinkingLine(content string) string {
+	return thinkingStyle.Render("💭 " + content)
+}
+
+// collapseThinkingLine finalises the current streaming thinking block: it
+// stores it in thinkingBlocks and renders it according to thinkingCollapsed.
+func (m *Model) collapseThinkingLine() {
+	if m.thinkingLineIdx < 0 || m.thinkingLineIdx >= len(m.lines) {
+		m.thinkingLineIdx = -1
+		m.thinkingContent = ""
+		return
+	}
+	block := thinkingBlock{lineIdx: m.thinkingLineIdx, content: m.thinkingContent}
+	m.thinkingBlocks = append(m.thinkingBlocks, block)
+	m.lines[block.lineIdx] = renderThinkingBlock(block.content, m.thinkingCollapsed)
+	m.thinkingLineIdx = -1
+	m.thinkingContent = ""
+}
+
+// toggleThinking flips thinkingCollapsed and re-renders every finished block.
+func (m *Model) toggleThinking() {
+	m.thinkingCollapsed = !m.thinkingCollapsed
+	for _, b := range m.thinkingBlocks {
+		if b.lineIdx >= 0 && b.lineIdx < len(m.lines) {
+			m.lines[b.lineIdx] = renderThinkingBlock(b.content, m.thinkingCollapsed)
+		}
+	}
+}
+
+// renderThinkingBlock returns the line text for a finished thinking block.
+func renderThinkingBlock(content string, collapsed bool) string {
+	if collapsed {
+		return metaStyle.Render("💭 [thinking]")
+	}
+	return thinkingLine(content)
+}
 func assistantLine(content string) string { return asstStyle.Render("Assistant:") + " " + content }
+
+// renderAssistantMarkdown renders content through glamour and prepends the
+// styled "Assistant:" label. Falls back to plain assistantLine on error.
+// r must not be nil; it is the pre-initialised renderer stored on the Model.
+func renderAssistantMarkdown(r *glamour.TermRenderer, content string, width int) string {
+	if r == nil || width <= 0 {
+		return assistantLine(content)
+	}
+	rendered, err := r.Render(content)
+	if err != nil {
+		return assistantLine(content)
+	}
+	return asstStyle.Render("Assistant:") + "\n" + strings.TrimRight(rendered, "\n")
+}
 
 func summarize(input string) string {
 	trimmed := strings.TrimSpace(input)
@@ -905,7 +1193,7 @@ func lastAssistantContent(messages []openrouter.Message) string {
 	return ""
 }
 
-func renderHistoryLines(messages []openrouter.Message) []string {
+func (m Model) renderHistoryLines(messages []openrouter.Message) []string {
 	out := make([]string, 0, len(messages))
 	for _, msg := range messages {
 		switch msg.Role {
@@ -915,7 +1203,7 @@ func renderHistoryLines(messages []openrouter.Message) []string {
 			}
 		case "assistant":
 			if strings.TrimSpace(msg.Content) != "" {
-				out = append(out, assistantLine(msg.Content))
+				out = append(out, renderAssistantMarkdown(m.mdRenderer, msg.Content, m.width))
 			}
 			for _, tc := range msg.ToolCalls {
 				out = append(out, metaStyle.Render(fmt.Sprintf("↳ tool call: %s(%s)", tc.Function.Name, tc.Function.Arguments)))

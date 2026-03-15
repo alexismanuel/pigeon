@@ -16,6 +16,7 @@ var builtinCommands = []commandDef{
 	{"/label", "[text]", "label the current session (no arg = show current)"},
 	{"/system", "[text]", "set system prompt for this session (no arg = show current)"},
 	{"/tree", "", "show conversation tree"},
+	{"/keybinds", "", "show all active keybindings"},
 	{"/quit", "", "exit pigeon"},
 }
 

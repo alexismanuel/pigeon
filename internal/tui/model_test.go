@@ -9,6 +9,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"pigeon/internal/config"
 	"pigeon/internal/provider/openrouter"
 	"pigeon/internal/resources"
 	"pigeon/internal/session"
@@ -118,7 +119,7 @@ func TestLastAssistantContent_SkipsEmpty(t *testing.T) {
 // ── renderHistoryLines ────────────────────────────────────────────────────────
 
 func TestRenderHistoryLines_Empty(t *testing.T) {
-	lines := renderHistoryLines(nil)
+	lines := Model{}.renderHistoryLines(nil)
 	if len(lines) != 0 {
 		t.Errorf("expected 0 lines for empty history")
 	}
@@ -129,7 +130,7 @@ func TestRenderHistoryLines_UserAndAssistant(t *testing.T) {
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "hi there"},
 	}
-	lines := renderHistoryLines(msgs)
+	lines := Model{}.renderHistoryLines(msgs)
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 lines, got %d", len(lines))
 	}
@@ -145,7 +146,7 @@ func TestRenderHistoryLines_ToolMessages(t *testing.T) {
 	msgs := []openrouter.Message{
 		{Role: "tool", Name: "bash", Content: "output here"},
 	}
-	lines := renderHistoryLines(msgs)
+	lines := Model{}.renderHistoryLines(msgs)
 	if len(lines) != 1 {
 		t.Fatalf("expected 1 line, got %d", len(lines))
 	}
@@ -163,7 +164,7 @@ func TestRenderHistoryLines_AssistantToolCalls(t *testing.T) {
 			},
 		},
 	}
-	lines := renderHistoryLines(msgs)
+	lines := Model{}.renderHistoryLines(msgs)
 	if len(lines) != 1 {
 		t.Fatalf("expected 1 line for tool call, got %d", len(lines))
 	}
@@ -177,7 +178,7 @@ func TestRenderHistoryLines_EmptyContentSkipped(t *testing.T) {
 		{Role: "user", Content: "   "},
 		{Role: "assistant", Content: ""},
 	}
-	lines := renderHistoryLines(msgs)
+	lines := Model{}.renderHistoryLines(msgs)
 	if len(lines) != 0 {
 		t.Errorf("expected empty lines to be skipped, got %d lines", len(lines))
 	}
@@ -287,7 +288,7 @@ func TestBuildResourceCmds_SkillsAndPrompts(t *testing.T) {
 // ── suggestion update via model.Update ───────────────────────────────────────
 
 func newTestModel() Model {
-	return NewModel(nil, nil, "test-model", nil, "", nil, nil, nil)
+	return NewModel(nil, nil, "test-model", nil, "", nil, nil, nil, config.Settings{})
 }
 
 func typeInto(m Model, chars string) Model {

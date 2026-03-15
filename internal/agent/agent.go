@@ -36,6 +36,7 @@ type ToolEvent struct {
 
 type TurnCallbacks struct {
 	OnToken        func(string)
+	OnThinkingToken func(string) // reasoning/thinking tokens from models that expose them
 	OnToolEvent    func(ToolEvent)
 	// BeforeToolCall fires synchronously before each tool execution.
 	// Returning true blocks the call; the agent substitutes a canned
@@ -72,6 +73,9 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 	if cb.OnToken == nil {
 		cb.OnToken = func(string) {}
 	}
+	if cb.OnThinkingToken == nil {
+		cb.OnThinkingToken = func(string) {}
+	}
 	if cb.OnToolEvent == nil {
 		cb.OnToolEvent = func(ToolEvent) {}
 	}
@@ -86,6 +90,9 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 
 	for round := 0; round < maxToolRounds; round++ {
 		assistantMsg, err := a.client.StreamChatCompletion(ctx, model, messages, toolDefs, func(event openrouter.StreamEvent) {
+			if event.Delta.Reasoning != "" {
+				cb.OnThinkingToken(event.Delta.Reasoning)
+			}
 			if event.Delta.Content != "" {
 				cb.OnToken(event.Delta.Content)
 			}

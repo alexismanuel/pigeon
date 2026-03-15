@@ -381,6 +381,47 @@ func generateNodeID() (string, error) {
 	return fmt.Sprintf("n-%s", hex.EncodeToString(buf)), nil
 }
 
+// DeleteSession removes the session's JSONL file and its meta sidecar (if any).
+// It is a no-op when the files don't exist.
+func (m *Manager) DeleteSession(sessionID string) error {
+	path, err := m.sessionPath(sessionID)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session: %w", err)
+	}
+	metaPath, err := m.metaPath(sessionID)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(metaPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session meta: %w", err)
+	}
+	return nil
+}
+
+// PruneEmptySessions deletes every session that contains no user messages.
+// It returns the number of sessions that were removed.
+func (m *Manager) PruneEmptySessions() (int, error) {
+	sessions, err := m.ListSessions(0)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, s := range sessions {
+		first, err := m.GetFirstUserMessage(s.ID)
+		if err != nil || first != "" {
+			continue
+		}
+		if err := m.DeleteSession(s.ID); err != nil {
+			continue
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 // GetFirstUserMessage returns the content of the first user message in the
 // session, or "" if none exists. Reads the JSONL line-by-line and stops early.
 func (m *Manager) GetFirstUserMessage(sessionID string) (string, error) {

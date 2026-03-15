@@ -47,7 +47,8 @@ type ToolFunctionCall struct {
 }
 
 type StreamDelta struct {
-	Content string
+	Content   string
+	Reasoning string // thinking tokens from reasoning models (e.g. Kimi K2)
 }
 
 type StreamEvent struct {
@@ -220,6 +221,9 @@ func (c *Client) StreamChatCompletion(
 			return Message{}, fmt.Errorf("decode stream chunk: %w", err)
 		}
 		for _, choice := range chunk.Choices {
+			if choice.Delta.Reasoning != "" {
+				onEvent(StreamEvent{Delta: StreamDelta{Reasoning: choice.Delta.Reasoning}})
+			}
 			if choice.Delta.Content != "" {
 				contentBuilder.WriteString(choice.Delta.Content)
 				onEvent(StreamEvent{Delta: StreamDelta{Content: choice.Delta.Content}})
@@ -296,6 +300,7 @@ type sseChunk struct {
 	Choices []struct {
 		Delta struct {
 			Content   string `json:"content"`
+			Reasoning string `json:"reasoning"` // thinking tokens from reasoning models
 			ToolCalls []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`

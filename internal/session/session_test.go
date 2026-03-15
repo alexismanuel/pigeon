@@ -580,3 +580,104 @@ func TestNewManager_CustomBaseDir(t *testing.T) {
 		t.Error("expected non-nil manager")
 	}
 }
+
+// ── DeleteSession ─────────────────────────────────────────────────────────────
+
+func TestDeleteSession_RemovesFiles(t *testing.T) {
+	m := NewManager(t.TempDir())
+	id, _ := m.NewSession()
+	m.SetSessionModel(id, "openai/gpt-4o")
+
+	if err := m.DeleteSession(id); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+
+	// JSONL file should be gone.
+	sessions, _ := m.ListSessions(0)
+	for _, s := range sessions {
+		if s.ID == id {
+			t.Error("deleted session still appears in ListSessions")
+		}
+	}
+
+	// Meta sidecar should be gone — GetSessionModel should return empty.
+	model, err := m.GetSessionModel(id)
+	if err != nil {
+		t.Fatalf("GetSessionModel after delete: %v", err)
+	}
+	if model != "" {
+		t.Errorf("expected empty model after delete, got %q", model)
+	}
+}
+
+func TestDeleteSession_NonExistentIsNoOp(t *testing.T) {
+	m := NewManager(t.TempDir())
+	if err := m.DeleteSession("nonexistent-session-id"); err != nil {
+		t.Fatalf("DeleteSession on nonexistent should be a no-op, got: %v", err)
+	}
+}
+
+func TestDeleteSession_InvalidIDErrors(t *testing.T) {
+	m := NewManager(t.TempDir())
+	if err := m.DeleteSession("../evil"); err == nil {
+		t.Error("expected error for invalid session id")
+	}
+}
+
+// ── PruneEmptySessions ────────────────────────────────────────────────────────
+
+func TestPruneEmptySessions_RemovesEmptyOnly(t *testing.T) {
+	m := NewManager(t.TempDir())
+
+	// empty session — no messages
+	emptyID, _ := m.NewSession()
+
+	// non-empty session
+	filledID, _ := m.NewSession()
+	m.AppendMessages(filledID, "", []openrouter.Message{{Role: "user", Content: "hello"}})
+
+	removed, err := m.PruneEmptySessions()
+	if err != nil {
+		t.Fatalf("PruneEmptySessions: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("expected 1 removed, got %d", removed)
+	}
+
+	sessions, _ := m.ListSessions(0)
+	ids := make(map[string]bool)
+	for _, s := range sessions {
+		ids[s.ID] = true
+	}
+	if ids[emptyID] {
+		t.Error("empty session should have been pruned")
+	}
+	if !ids[filledID] {
+		t.Error("filled session should have been kept")
+	}
+}
+
+func TestPruneEmptySessions_NothingToPrune(t *testing.T) {
+	m := NewManager(t.TempDir())
+	id, _ := m.NewSession()
+	m.AppendMessages(id, "", []openrouter.Message{{Role: "user", Content: "hi"}})
+
+	removed, err := m.PruneEmptySessions()
+	if err != nil {
+		t.Fatalf("PruneEmptySessions: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("expected 0 removed, got %d", removed)
+	}
+}
+
+func TestPruneEmptySessions_EmptyDir(t *testing.T) {
+	m := NewManager(t.TempDir())
+	removed, err := m.PruneEmptySessions()
+	if err != nil {
+		t.Fatalf("PruneEmptySessions on empty dir: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("expected 0 removed, got %d", removed)
+	}
+}

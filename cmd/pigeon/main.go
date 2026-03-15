@@ -23,6 +23,7 @@ func main() {
 	flag.Parse()
 
 	systemPrompt := config.ResolveSystemPrompt(*systemFlag)
+	settings := config.LoadSettings()
 
 	apiKey, err := app.ResolveOpenRouterAPIKey(os.Getenv)
 	if err != nil {
@@ -34,6 +35,9 @@ func main() {
 	ag := agent.New(client)
 
 	sessionManager := session.NewManager("")
+	if _, err := sessionManager.PruneEmptySessions(); err != nil {
+		fmt.Fprintf(os.Stderr, "pigeon: warning: failed to prune empty sessions: %v\n", err)
+	}
 	sessionID, err := sessionManager.NewSession()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pigeon: warning: failed to initialize session file: %v\n", err)
@@ -61,7 +65,7 @@ func main() {
 		}
 	}
 
-	m := tui.NewModel(ag, client, *model, sessionManager, sessionID, reg, runtime, statusCh, systemPrompt)
+	m := tui.NewModel(ag, client, *model, sessionManager, sessionID, reg, runtime, statusCh, settings, systemPrompt)
 	p := tea.NewProgram(m, tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "pigeon: runtime error: %v\n", err)
