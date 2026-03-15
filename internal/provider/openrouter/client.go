@@ -62,6 +62,9 @@ type ModelInfo struct {
 	ID            string
 	Name          string
 	ContextLength int
+	// Provider identifies the originating provider (e.g. "openrouter",
+	// "anthropic", "lmstudio"). Set by the multi-provider catalog.
+	Provider string
 }
 
 type Client struct {
@@ -129,6 +132,7 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 			ID:            id,
 			Name:          name,
 			ContextLength: item.Context,
+			Provider:      "openrouter",
 		})
 	}
 	sort.Slice(models, func(i, j int) bool {

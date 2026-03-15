@@ -329,7 +329,7 @@ func TestBuildResourceCmds_SkillsAndPrompts(t *testing.T) {
 // ── suggestion update via model.Update ───────────────────────────────────────
 
 func newTestModel() Model {
-	return NewModel(nil, nil, "test-model", nil, "", nil, nil, nil, config.Settings{}, nil)
+	return NewModel(nil, nil, "test-model", nil, "", nil, nil, nil, config.Settings{}, nil, nil)
 }
 
 func typeInto(m Model, chars string) Model {

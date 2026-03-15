@@ -188,18 +188,23 @@ func (p picker) View() string {
 				ctxStr = fmt.Sprintf("%dk ctx", m.ContextLength/1000)
 			}
 
+			providerBadge := ""
+			if m.Provider != "" {
+				providerBadge = fmt.Sprintf("[%s]", m.Provider)
+			}
 			if selected {
 				cursor := pickerCursorStyle.Render("▶ ")
 				row := pickerSelectedStyle.Render(
-					fmt.Sprintf("%-*s  %-*s  %-8s", nameW, name, idW, id, ctxStr),
+					fmt.Sprintf("%-*s  %-*s  %-11s  %-8s", nameW, name, idW, id, providerBadge, ctxStr),
 				)
 				b.WriteString(cursor + row + "\n")
 			} else {
 				cursor := "  "
 				nameStr := pickerNormalStyle.Render(fmt.Sprintf("%-*s", nameW, name))
 				idStr := pickerDimStyle.Render(fmt.Sprintf("  %-*s", idW, id))
+				provStr := pickerProviderStyle.Render(fmt.Sprintf("  %-11s", providerBadge))
 				ctxS := pickerDimStyle.Render(fmt.Sprintf("  %-8s", ctxStr))
-				b.WriteString(cursor + nameStr + idStr + ctxS + "\n")
+				b.WriteString(cursor + nameStr + idStr + provStr + ctxS + "\n")
 			}
 		}
 	}
@@ -225,7 +230,8 @@ func filterModels(models []openrouter.ModelInfo, query string) []openrouter.Mode
 	var out []openrouter.ModelInfo
 	for _, m := range models {
 		if strings.Contains(strings.ToLower(m.Name), q) ||
-			strings.Contains(strings.ToLower(m.ID), q) {
+			strings.Contains(strings.ToLower(m.ID), q) ||
+			strings.Contains(strings.ToLower(m.Provider), q) {
 			out = append(out, m)
 		}
 	}
@@ -243,6 +249,7 @@ var (
 	pickerDimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	pickerHintStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
 	pickerErrStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	pickerProviderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("3")) // yellow for provider badge
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────

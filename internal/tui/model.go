@@ -188,6 +188,16 @@ type Model struct {
 	permService permission.Service   // nil when permissions are disabled
 	currentPerm *permission.Request  // non-nil while a permission dialog is active
 
+	// login flow (loginSelectMode / loginAuthMode)
+	loginProviders []loginProvider      // providers shown in the selector
+	loginSelectIdx int                  // currently highlighted index
+	loginLines     []string             // progress lines shown in auth dialog
+	loginCh        chan loginEventMsg    // receives events from the OAuth goroutine
+	loginCancel    context.CancelFunc   // cancels the OAuth goroutine
+	// onProviderLogin is called after a successful OAuth login so callers can
+	// hot-add the new provider without restarting. May be nil.
+	onProviderLogin func(providerID string)
+
 	shellCh               chan tea.Msg // receives shellOutputMsg / shellDoneMsg from background shell
 	shellBlockIdx         int         // index of the active bShellBlock, -1 = none
 	shellCmdParentNodeID  string      // currentNodeID captured at shell command start, for session recording
@@ -269,7 +279,7 @@ type permRequestMsg struct {
 	req permission.Request
 }
 
-func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions sessionStore, sessionID string, reg *resources.Registry, rt *luaext.Runtime, statusCh <-chan luaext.StatusUpdate, settings config.Settings, perm permission.Service, systemPrompt ...string) Model {
+func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions sessionStore, sessionID string, reg *resources.Registry, rt *luaext.Runtime, statusCh <-chan luaext.StatusUpdate, settings config.Settings, perm permission.Service, onProviderLogin func(providerID string), systemPrompt ...string) Model {
 	in := textinput.New()
 	in.Placeholder = "Ask pigeon..."
 	in.Prompt = "> "
@@ -317,6 +327,7 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 		statuses:              make(map[string]string),
 		resourceCmds:          buildResourceCmds(reg, rt),
 		permService:           perm,
+		onProviderLogin:       onProviderLogin,
 	}
 	if len(systemPrompt) > 0 {
 		m.systemPrompt = strings.TrimSpace(systemPrompt[0])
@@ -446,6 +457,12 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if m.mode == permissionMode {
 		return m.updatePermission(msg)
+	}
+	if m.mode == loginSelectMode {
+		return m.updateLoginSelect(msg)
+	}
+	if m.mode == loginAuthMode {
+		return m.updateLoginAuth(msg)
 	}
 	return m.updateChat(msg)
 }
@@ -1014,6 +1031,9 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch parts[0] {
+	case "/login":
+		return m.enterLoginSelect()
+
 	case "/quit":
 		if m.runtime != nil {
 			m.runtime.Fire(luaext.Event{Kind: luaext.EventSessionShutdown}) //nolint
@@ -1294,6 +1314,12 @@ func (m Model) renderHeader() string {
 	if m.mode == permissionMode {
 		status = "awaiting permission"
 	}
+	if m.mode == loginSelectMode {
+		status = "login: select provider"
+	}
+	if m.mode == loginAuthMode {
+		status = "login: authenticating"
+	}
 	sessionText := "none"
 	if m.sessionID != "" {
 		sessionText = m.sessionID
@@ -1308,6 +1334,12 @@ func (m Model) renderHeader() string {
 func (m Model) viewChat(header string) string {
 	if m.mode == permissionMode {
 		return m.viewChatWithPermDialog(header)
+	}
+	if m.mode == loginSelectMode {
+		return m.viewChatWithLoginSelect(header)
+	}
+	if m.mode == loginAuthMode {
+		return m.viewChatWithLoginAuth(header)
 	}
 	// One reserved line between viewport and input: spinner while running,
 	// scroll indicator when scrolled up, blank otherwise.
@@ -1419,6 +1451,10 @@ func (m Model) recalcViewport() Model {
 	if m.mode == permissionMode {
 		// header + blank(1) + scrollLine(1) + dialog
 		chrome = headerLines + 1 + 1 + permDialogChrome - 1
+	} else if m.mode == loginSelectMode {
+		chrome = headerLines + 1 + 1 + loginSelectChrome - 1
+	} else if m.mode == loginAuthMode {
+		chrome = headerLines + 1 + 1 + loginAuthChrome - 1
 	} else {
 		// header + blank(1) + scrollLine(1) + input(1)
 		visibleSuggs := len(m.suggestions)
