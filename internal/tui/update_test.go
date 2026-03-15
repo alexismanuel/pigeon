@@ -45,7 +45,7 @@ func newModelWithSessions(t *testing.T) (Model, *session.Manager, string) {
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	m := NewModel(nil, nil, "test-model", mgr, id, nil, nil, nil, config.Settings{})
+	m := NewModel(nil, nil, "test-model", mgr, id, nil, nil, nil, config.Settings{}, nil)
 	return m, mgr, id
 }
 
@@ -92,7 +92,7 @@ func TestInit_WithRuntime(t *testing.T) {
 	defer rt.Close()
 	rt.LoadString("t", `pigeon.on("session_start", function() pigeon.set_status("x","fired") end)`)
 
-	m := NewModel(nil, nil, "m", nil, "", nil, rt, ch, config.Settings{})
+	m := NewModel(nil, nil, "m", nil, "", nil, rt, ch, config.Settings{}, nil)
 	cmd := m.Init()
 	if cmd == nil {
 		t.Error("Init with runtime should return a batch cmd")
@@ -129,8 +129,7 @@ func TestUpdate_StatusClear(t *testing.T) {
 func runningModel() Model {
 	m := newTestModel()
 	m.running = true
-	m.lines = append(m.lines, assistantLine(""))
-	m.assistantLineIdx = len(m.lines) - 1
+	m.streamingAssistantIdx = -1
 	m.streamCh = make(chan tea.Msg, 32)
 	return m
 }
@@ -141,26 +140,30 @@ func TestUpdateChat_TokenAppendsToLine(t *testing.T) {
 
 	next, _ := m.Update(tokenMsg{token: "world"})
 	tm := next.(Model)
-	if !strings.Contains(tm.lines[tm.assistantLineIdx], "world") {
-		t.Errorf("token not in assistant line: %q", tm.lines[tm.assistantLineIdx])
+	if tm.streamingAssistantIdx < 0 {
+		t.Fatal("streamingAssistantIdx not set after token")
+	}
+	if !strings.Contains(tm.lines[tm.streamingAssistantIdx], "world") {
+		t.Errorf("token not in assistant line: %q", tm.lines[tm.streamingAssistantIdx])
 	}
 }
 
 func TestUpdateChat_TokenCreatesNewLineWhenNoneActive(t *testing.T) {
 	m := newTestModel()
 	m.running = true
-	m.assistantLineIdx = -1
+	m.streamingAssistantIdx = -1
 	m.streamCh = make(chan tea.Msg, 32)
 	defer close(m.streamCh)
 	before := len(m.lines)
 
 	next, _ := m.Update(tokenMsg{token: "hi"})
 	tm := next.(Model)
-	if len(tm.lines) != before+1 {
-		t.Errorf("expected new line; before=%d after=%d", before, len(tm.lines))
+	// We add a bSep + bAssistant block = 2 new entries.
+	if len(tm.lines) != before+2 {
+		t.Errorf("expected 2 new lines (separator+block); before=%d after=%d", before, len(tm.lines))
 	}
-	if tm.assistantLineIdx < 0 {
-		t.Error("assistantLineIdx should be set after token on empty line")
+	if tm.streamingAssistantIdx < 0 {
+		t.Error("streamingAssistantIdx should be set after token on empty state")
 	}
 }
 
@@ -172,8 +175,11 @@ func TestUpdateChat_MultipleTokensAccumulate(t *testing.T) {
 		next, _ := m.Update(tokenMsg{token: tok})
 		m = next.(Model)
 	}
-	if !strings.Contains(m.lines[m.assistantLineIdx], "foo bar") {
-		t.Errorf("expected accumulated tokens, got %q", m.lines[m.assistantLineIdx])
+	if m.streamingAssistantIdx < 0 {
+		t.Fatal("streamingAssistantIdx not set")
+	}
+	if !strings.Contains(m.lines[m.streamingAssistantIdx], "foo bar") {
+		t.Errorf("expected accumulated tokens, got %q", m.lines[m.streamingAssistantIdx])
 	}
 }
 
@@ -185,8 +191,8 @@ func TestUpdateChat_ToolCallResetsAssistantLine(t *testing.T) {
 
 	next, _ := m.Update(toolCallMsg{name: "bash", args: `{"command":"ls"}`})
 	tm := next.(Model)
-	if tm.assistantLineIdx != -1 {
-		t.Error("assistantLineIdx should be -1 after tool call")
+	if tm.streamingAssistantIdx != -1 {
+		t.Error("streamingAssistantIdx should be -1 after tool call")
 	}
 }
 
@@ -218,13 +224,45 @@ func TestUpdateChat_ToolResultAddsLine(t *testing.T) {
 	tm := next.(Model)
 	found := false
 	for _, l := range tm.lines {
-		if strings.Contains(l, "read") {
+		if strings.Contains(l, "file-contents") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("expected tool result line: %v", tm.lines)
+		t.Errorf("expected tool result content in lines: %v", tm.lines)
+	}
+}
+
+func TestUpdateChat_ToolCallThenResult_IconFlips(t *testing.T) {
+	m := runningModel()
+	defer close(m.streamCh)
+
+	// First, a tool call is emitted (streaming=true → running icon).
+	next, _ := m.Update(toolCallMsg{name: "bash", args: `{"command":"ls"}`})
+	tm := next.(Model)
+	callIdx := -1
+	for i, b := range tm.chatBlocks {
+		if b.kind == bToolCall && b.toolName == "bash" {
+			callIdx = i
+			break
+		}
+	}
+	if callIdx < 0 {
+		t.Fatal("bToolCall block not found")
+	}
+	if !tm.chatBlocks[callIdx].streaming {
+		t.Error("bToolCall should have streaming=true while running")
+	}
+
+	// Then the result arrives — the bToolCall header should flip to success.
+	next2, _ := tm.Update(toolResultMsg{name: "bash", result: "output"})
+	tm2 := next2.(Model)
+	if tm2.chatBlocks[callIdx].streaming {
+		t.Error("bToolCall should have streaming=false after result")
+	}
+	if tm2.chatBlocks[callIdx].isErr {
+		t.Error("bToolCall should not be isErr for a successful result")
 	}
 }
 
@@ -259,8 +297,8 @@ func TestUpdateChat_TurnDone_ClearsRunning(t *testing.T) {
 	if tm.running {
 		t.Error("running should be false after turn done")
 	}
-	if tm.assistantLineIdx != -1 {
-		t.Error("assistantLineIdx should be -1 after turn done")
+	if tm.streamingAssistantIdx != -1 {
+		t.Error("streamingAssistantIdx should be -1 after turn done")
 	}
 }
 
@@ -277,15 +315,24 @@ func TestUpdateChat_TurnDone_AppendsHistory(t *testing.T) {
 	}
 }
 
-func TestUpdateChat_TurnDone_FillsEmptyAssistantLine(t *testing.T) {
+func TestUpdateChat_TurnDone_FillsAssistantBlock(t *testing.T) {
 	m := runningModel()
-	// line was empty (only the "Assistant: " prefix was there, no streamed tokens)
-	idx := m.assistantLineIdx
+	// Simulate a streaming assistant block with no tokens yet.
+	m.appendBlock(chatBlock{kind: bSep})
+	m.streamingAssistantIdx = m.appendBlock(chatBlock{kind: bAssistant, streaming: true})
 	msgs := []openrouter.Message{{Role: "assistant", Content: "final answer"}}
 	next, _ := m.Update(turnDoneMsg{newMessages: msgs})
 	tm := next.(Model)
-	if !strings.Contains(tm.lines[idx], "final answer") {
-		t.Errorf("empty assistant line should be filled from turnDone: %q", tm.lines[idx])
+	// Check the block content directly (lines contain ANSI codes from rendering).
+	found := false
+	for _, b := range tm.chatBlocks {
+		if b.kind == bAssistant && strings.Contains(b.content, "final answer") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("assistant block content should contain 'final answer' after turnDone")
 	}
 }
 
@@ -298,8 +345,8 @@ func TestUpdateChat_TurnErr(t *testing.T) {
 	if tm.running {
 		t.Error("running should be false after error")
 	}
-	if tm.assistantLineIdx != -1 {
-		t.Error("assistantLineIdx should be -1")
+	if tm.streamingAssistantIdx != -1 {
+		t.Error("streamingAssistantIdx should be -1")
 	}
 	found := false
 	for _, l := range tm.lines {
@@ -346,7 +393,7 @@ func TestUpdateChat_ExtCommandDone_WithError(t *testing.T) {
 // ── submitPrompt ──────────────────────────────────────────────────────────────
 
 func TestSubmitPrompt_SetsRunning(t *testing.T) {
-	m := NewModel(&fakeAgent{response: "hello"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{})
+	m := NewModel(&fakeAgent{response: "hello"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{}, nil)
 	next, cmd := m.submitPrompt("say hello")
 	tm := next.(Model)
 	if !tm.running {
@@ -358,7 +405,7 @@ func TestSubmitPrompt_SetsRunning(t *testing.T) {
 }
 
 func TestSubmitPrompt_AddsUserAndAssistantLines(t *testing.T) {
-	m := NewModel(&fakeAgent{response: "hello"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{})
+	m := NewModel(&fakeAgent{response: "hello"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{}, nil)
 	next, cmd := m.submitPrompt("say hello")
 	m = next.(Model)
 	m = streamedModel(t, m, cmd)
@@ -509,7 +556,7 @@ func TestHandleCommand_SkillWithRegistry(t *testing.T) {
 	writeFile(t, global+"/skills/py/SKILL.md", "be a python expert")
 	reg, _ := resources.LoadFrom(global, "")
 
-	m := NewModel(nil, nil, "m", nil, "", reg, nil, nil, config.Settings{})
+	m := NewModel(nil, nil, "m", nil, "", reg, nil, nil, config.Settings{}, nil)
 	next, _ := m.handleCommand("/skill:py")
 	tm := next.(Model)
 	found := false
@@ -529,7 +576,7 @@ func TestHandleCommand_PromptExpansion(t *testing.T) {
 	writeFile(t, global+"/prompts/review.md", "Please review the following code:")
 	reg, _ := resources.LoadFrom(global, "")
 
-	m := NewModel(nil, nil, "m", nil, "", reg, nil, nil, config.Settings{})
+	m := NewModel(nil, nil, "m", nil, "", reg, nil, nil, config.Settings{}, nil)
 	next, _ := m.handleCommand("/review")
 	tm := next.(Model)
 	if !strings.Contains(tm.input.Value(), "Please review") {
@@ -682,7 +729,7 @@ func TestRecalcViewport_ChromeIncludesSuggestions(t *testing.T) {
 }
 
 func TestAutoScroll_NewContentScrollsDown(t *testing.T) {
-	m := NewModel(&fakeAgent{response: "hello world"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{})
+	m := NewModel(&fakeAgent{response: "hello world"}, nil, "test-model", nil, "", nil, nil, nil, config.Settings{}, nil)
 	m.autoScroll = true
 	next2, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m = next2.(Model)
@@ -749,14 +796,14 @@ func TestHandleCommand_System_ShowCurrent(t *testing.T) {
 }
 
 func TestNewModel_SystemPromptVariadic(t *testing.T) {
-	m := NewModel(nil, nil, "model", nil, "", nil, nil, nil, config.Settings{}, "You are a pirate.")
+	m := NewModel(nil, nil, "model", nil, "", nil, nil, nil, config.Settings{}, nil, "You are a pirate.")
 	if m.systemPrompt != "You are a pirate." {
 		t.Errorf("expected system prompt, got %q", m.systemPrompt)
 	}
 }
 
 func TestNewModel_NoSystemPrompt(t *testing.T) {
-	m := NewModel(nil, nil, "model", nil, "", nil, nil, nil, config.Settings{})
+	m := NewModel(nil, nil, "model", nil, "", nil, nil, nil, config.Settings{}, nil)
 	if m.systemPrompt != "" {
 		t.Errorf("expected empty system prompt, got %q", m.systemPrompt)
 	}
@@ -802,7 +849,7 @@ func TestPruneCurrentSessionIfEmpty_NoOpWhenNoStore(t *testing.T) {
 
 func TestPruneCurrentSessionIfEmpty_NoOpWhenNoSessionID(t *testing.T) {
 	mgr := session.NewManager(t.TempDir())
-	m := NewModel(nil, nil, "test-model", mgr, "", nil, nil, nil, config.Settings{})
+	m := NewModel(nil, nil, "test-model", mgr, "", nil, nil, nil, config.Settings{}, nil)
 	// Should not panic and should not delete anything.
 	m.pruneCurrentSessionIfEmpty()
 }

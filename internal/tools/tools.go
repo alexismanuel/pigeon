@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"pigeon/internal/permission"
 	"pigeon/internal/provider/openrouter"
 )
 
@@ -21,11 +22,13 @@ const (
 )
 
 type Executor struct {
-	baseDir  string
-	maxLines int
-	maxBytes int
+	baseDir     string
+	maxLines    int
+	maxBytes    int
+	permissions permission.Service // nil = no permission checks
 }
 
+// NewExecutor creates an executor with no permission checks.
 func NewExecutor() *Executor {
 	wd, err := os.Getwd()
 	if err != nil {
@@ -36,6 +39,14 @@ func NewExecutor() *Executor {
 		maxLines: defaultOutputMaxLines,
 		maxBytes: defaultOutputMaxBytes,
 	}
+}
+
+// NewExecutorWithPermissions creates an executor that checks permissions before
+// running bash, write, or edit operations.
+func NewExecutorWithPermissions(perm permission.Service) *Executor {
+	e := NewExecutor()
+	e.permissions = perm
+	return e
 }
 
 func (e *Executor) Definitions() []openrouter.ToolDefinition {
@@ -110,9 +121,9 @@ func (e *Executor) Execute(ctx context.Context, name, argumentsJSON string) (str
 	case "read":
 		return e.execRead(argumentsJSON)
 	case "write":
-		return e.execWrite(argumentsJSON)
+		return e.execWrite(ctx, argumentsJSON)
 	case "edit":
-		return e.execEdit(argumentsJSON)
+		return e.execEdit(ctx, argumentsJSON)
 	case "bash":
 		return e.execBash(ctx, argumentsJSON)
 	default:
@@ -171,7 +182,7 @@ type writeArgs struct {
 	Content string `json:"content"`
 }
 
-func (e *Executor) execWrite(argumentsJSON string) (string, error) {
+func (e *Executor) execWrite(ctx context.Context, argumentsJSON string) (string, error) {
 	var args writeArgs
 	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -180,6 +191,25 @@ func (e *Executor) execWrite(argumentsJSON string) (string, error) {
 		return "", errors.New("path is required")
 	}
 	path := e.resolvePath(args.Path)
+
+	if e.permissions != nil {
+		sessionID := permission.SessionIDFromContext(ctx)
+		granted, err := e.permissions.Request(ctx, permission.CreatePermissionRequest{
+			SessionID:   sessionID,
+			ToolName:    "write",
+			Action:      "create",
+			Description: fmt.Sprintf("Write %d bytes to %s", len(args.Content), path),
+			Path:        path,
+			Params:      permission.WriteParams{Path: path, Content: args.Content},
+		})
+		if err != nil {
+			return "", fmt.Errorf("permission denied: %w", err)
+		}
+		if !granted {
+			return "", errors.New("permission denied")
+		}
+	}
+
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("create parent directories for %s: %w", path, err)
 	}
@@ -195,7 +225,7 @@ type editArgs struct {
 	NewText string `json:"newText"`
 }
 
-func (e *Executor) execEdit(argumentsJSON string) (string, error) {
+func (e *Executor) execEdit(ctx context.Context, argumentsJSON string) (string, error) {
 	var args editArgs
 	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -204,6 +234,25 @@ func (e *Executor) execEdit(argumentsJSON string) (string, error) {
 		return "", errors.New("path is required")
 	}
 	path := e.resolvePath(args.Path)
+
+	if e.permissions != nil {
+		sessionID := permission.SessionIDFromContext(ctx)
+		granted, err := e.permissions.Request(ctx, permission.CreatePermissionRequest{
+			SessionID:   sessionID,
+			ToolName:    "edit",
+			Action:      "modify",
+			Description: fmt.Sprintf("Edit %s", path),
+			Path:        path,
+			Params:      permission.EditParams{Path: path, OldText: args.OldText, NewText: args.NewText},
+		})
+		if err != nil {
+			return "", fmt.Errorf("permission denied: %w", err)
+		}
+		if !granted {
+			return "", errors.New("permission denied")
+		}
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", path, err)
@@ -235,6 +284,24 @@ func (e *Executor) execBash(ctx context.Context, argumentsJSON string) (string, 
 	}
 	if strings.TrimSpace(args.Command) == "" {
 		return "", errors.New("command is required")
+	}
+
+	if e.permissions != nil {
+		sessionID := permission.SessionIDFromContext(ctx)
+		granted, err := e.permissions.Request(ctx, permission.CreatePermissionRequest{
+			SessionID:   sessionID,
+			ToolName:    "bash",
+			Action:      "execute",
+			Description: args.Command,
+			Path:        e.baseDir,
+			Params:      permission.BashParams{Command: args.Command},
+		})
+		if err != nil {
+			return "", fmt.Errorf("permission denied: %w", err)
+		}
+		if !granted {
+			return "", errors.New("permission denied")
+		}
 	}
 
 	runCtx := ctx

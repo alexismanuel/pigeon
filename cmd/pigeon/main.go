@@ -11,9 +11,11 @@ import (
 	"pigeon/internal/app"
 	"pigeon/internal/config"
 	luaext "pigeon/internal/extensions/lua"
+	"pigeon/internal/permission"
 	"pigeon/internal/provider/openrouter"
 	"pigeon/internal/resources"
 	"pigeon/internal/session"
+	"pigeon/internal/tools"
 	"pigeon/internal/tui"
 )
 
@@ -32,7 +34,17 @@ func main() {
 	}
 
 	client := openrouter.NewClient(apiKey, nil)
-	ag := agent.New(client)
+
+	// Build the permission service from settings and wire it into the executor.
+	workingDir, _ := os.Getwd()
+	permService := permission.NewService(
+		workingDir,
+		settings.Permissions.SkipRequests,
+		settings.Permissions.AllowedTools,
+		settings.Permissions.BashDenyPatterns,
+	)
+	executor := tools.NewExecutorWithPermissions(permService)
+	ag := agent.NewWithTools(client, executor)
 
 	sessionManager := session.NewManager("")
 	if _, err := sessionManager.PruneEmptySessions(); err != nil {
@@ -65,7 +77,7 @@ func main() {
 		}
 	}
 
-	m := tui.NewModel(ag, client, *model, sessionManager, sessionID, reg, runtime, statusCh, settings, systemPrompt)
+	m := tui.NewModel(ag, client, *model, sessionManager, sessionID, reg, runtime, statusCh, settings, permService, systemPrompt)
 	p := tea.NewProgram(m, tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "pigeon: runtime error: %v\n", err)

@@ -116,46 +116,84 @@ func TestLastAssistantContent_SkipsEmpty(t *testing.T) {
 	}
 }
 
-// ── renderHistoryLines ────────────────────────────────────────────────────────
+// ── stripBlankLines ───────────────────────────────────────────────────────────
 
-func TestRenderHistoryLines_Empty(t *testing.T) {
-	lines := Model{}.renderHistoryLines(nil)
-	if len(lines) != 0 {
-		t.Errorf("expected 0 lines for empty history")
+func TestStripBlankLines_NoBlankLines(t *testing.T) {
+	got := stripBlankLines("hello\nworld")
+	if got != "hello\nworld" {
+		t.Errorf("unexpected: %q", got)
 	}
 }
 
-func TestRenderHistoryLines_UserAndAssistant(t *testing.T) {
+func TestStripBlankLines_RemovesInternalBlanks(t *testing.T) {
+	got := stripBlankLines("para1\n\npara2")
+	if got != "para1\npara2" {
+		t.Errorf("expected blank line removed, got %q", got)
+	}
+}
+
+func TestStripBlankLines_RemovesWhitespaceOnlyLines(t *testing.T) {
+	got := stripBlankLines("a\n   \nb")
+	if got != "a\nb" {
+		t.Errorf("expected whitespace-only line removed, got %q", got)
+	}
+}
+
+func TestStripBlankLines_EmptyInput(t *testing.T) {
+	got := stripBlankLines("")
+	if got != "" {
+		t.Errorf("expected empty string, got %q", got)
+	}
+}
+
+// ── appendHistoryBlocks ───────────────────────────────────────────────────────
+
+func TestAppendHistoryBlocks_Empty(t *testing.T) {
+	m := Model{}
+	m.appendHistoryBlocks(nil)
+	if len(m.chatBlocks) != 0 {
+		t.Errorf("expected 0 blocks for empty history, got %d", len(m.chatBlocks))
+	}
+}
+
+func TestAppendHistoryBlocks_UserAndAssistant(t *testing.T) {
 	msgs := []openrouter.Message{
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "hi there"},
 	}
-	lines := Model{}.renderHistoryLines(msgs)
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 lines, got %d", len(lines))
+	m := Model{}
+	m.appendHistoryBlocks(msgs)
+	// Each message has a bSep + content block = 4 blocks total.
+	if len(m.chatBlocks) != 4 {
+		t.Fatalf("expected 4 blocks (2 sep + 2 content), got %d", len(m.chatBlocks))
 	}
-	if !strings.Contains(lines[0], "hello") {
-		t.Errorf("user line should contain 'hello': %q", lines[0])
+	found := false
+	for _, b := range m.chatBlocks {
+		if strings.Contains(b.content, "hello") || strings.Contains(b.content, "hi there") {
+			found = true
+		}
 	}
-	if !strings.Contains(lines[1], "hi there") {
-		t.Errorf("assistant line should contain 'hi there': %q", lines[1])
+	if !found {
+		t.Errorf("expected blocks to contain message content")
 	}
 }
 
-func TestRenderHistoryLines_ToolMessages(t *testing.T) {
+func TestAppendHistoryBlocks_ToolMessages(t *testing.T) {
 	msgs := []openrouter.Message{
 		{Role: "tool", Name: "bash", Content: "output here"},
 	}
-	lines := Model{}.renderHistoryLines(msgs)
-	if len(lines) != 1 {
-		t.Fatalf("expected 1 line, got %d", len(lines))
+	m := Model{}
+	m.appendHistoryBlocks(msgs)
+	// bSep + bToolResult = 2 blocks
+	if len(m.chatBlocks) != 2 {
+		t.Fatalf("expected 2 blocks (sep + tool result), got %d", len(m.chatBlocks))
 	}
-	if !strings.Contains(lines[0], "bash") {
-		t.Errorf("tool line should contain tool name: %q", lines[0])
+	if m.chatBlocks[1].toolName != "bash" {
+		t.Errorf("expected toolName='bash', got %q", m.chatBlocks[1].toolName)
 	}
 }
 
-func TestRenderHistoryLines_AssistantToolCalls(t *testing.T) {
+func TestAppendHistoryBlocks_AssistantToolCalls(t *testing.T) {
 	msgs := []openrouter.Message{
 		{
 			Role: "assistant",
@@ -164,23 +202,26 @@ func TestRenderHistoryLines_AssistantToolCalls(t *testing.T) {
 			},
 		},
 	}
-	lines := Model{}.renderHistoryLines(msgs)
-	if len(lines) != 1 {
-		t.Fatalf("expected 1 line for tool call, got %d", len(lines))
+	m := Model{}
+	m.appendHistoryBlocks(msgs)
+	// bSep + bToolCall = 2 blocks
+	if len(m.chatBlocks) != 2 {
+		t.Fatalf("expected 2 blocks (sep + tool call), got %d", len(m.chatBlocks))
 	}
-	if !strings.Contains(lines[0], "read") {
-		t.Errorf("expected tool call line to mention 'read': %q", lines[0])
+	if m.chatBlocks[1].toolName != "read" {
+		t.Errorf("expected toolName='read', got %q", m.chatBlocks[1].toolName)
 	}
 }
 
-func TestRenderHistoryLines_EmptyContentSkipped(t *testing.T) {
+func TestAppendHistoryBlocks_EmptyContentSkipped(t *testing.T) {
 	msgs := []openrouter.Message{
 		{Role: "user", Content: "   "},
 		{Role: "assistant", Content: ""},
 	}
-	lines := Model{}.renderHistoryLines(msgs)
-	if len(lines) != 0 {
-		t.Errorf("expected empty lines to be skipped, got %d lines", len(lines))
+	m := Model{}
+	m.appendHistoryBlocks(msgs)
+	if len(m.chatBlocks) != 0 {
+		t.Errorf("expected empty content to be skipped, got %d blocks", len(m.chatBlocks))
 	}
 }
 
@@ -288,7 +329,7 @@ func TestBuildResourceCmds_SkillsAndPrompts(t *testing.T) {
 // ── suggestion update via model.Update ───────────────────────────────────────
 
 func newTestModel() Model {
-	return NewModel(nil, nil, "test-model", nil, "", nil, nil, nil, config.Settings{})
+	return NewModel(nil, nil, "test-model", nil, "", nil, nil, nil, config.Settings{}, nil)
 }
 
 func typeInto(m Model, chars string) Model {

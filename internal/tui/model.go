@@ -1,10 +1,13 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -18,6 +21,7 @@ import (
 	"pigeon/internal/agent"
 	"pigeon/internal/config"
 	luaext "pigeon/internal/extensions/lua"
+	"pigeon/internal/permission"
 	"pigeon/internal/provider/openrouter"
 	"pigeon/internal/resources"
 	"pigeon/internal/session"
@@ -33,11 +37,16 @@ var (
 type appMode int
 
 const (
-	chatMode     appMode = iota
-	pickerMode   appMode = iota
-	resumeMode   appMode = iota
-	nodePickMode appMode = iota
+	chatMode       appMode = iota
+	pickerMode     appMode = iota
+	resumeMode     appMode = iota
+	nodePickMode   appMode = iota
+	permissionMode appMode = iota
 )
+
+// permDialogChrome is the number of terminal lines the permission dialog
+// occupies below the viewport (replaces the normal input + status chrome).
+const permDialogChrome = 11
 
 type turnRunner interface {
 	RunTurn(ctx context.Context, model string, history []openrouter.Message, userInput string, cb agent.TurnCallbacks) ([]openrouter.Message, error)
@@ -73,11 +82,40 @@ type thinkingTokenMsg struct {
 	token string
 }
 
-// thinkingBlock records a completed thinking block so it can be toggled.
-type thinkingBlock struct {
-	lineIdx int
-	content string
+// blockKind identifies the kind of a chatBlock.
+type blockKind uint8
+
+const (
+	bSep        blockKind = iota // blank separator line between messages
+	bMeta                        // dim system text (session info, status)
+	bError                       // red error text
+	bShell                       // yellow shell output (legacy single-line)
+	bShellBlock                  // shell command + output combined block (user-message style)
+	bUser                        // user message
+	bAssistant                   // assistant message
+	bThinking                    // thinking block (collapsible)
+	bToolCall                    // tool invocation
+	bToolResult                  // tool result (collapsible)
+)
+
+// chatBlock is one display unit in the chat. m.chatBlocks and m.lines are kept
+// in strict 1:1 correspondence: m.lines[i] = m.renderBlock(m.chatBlocks[i]).
+type chatBlock struct {
+	kind     blockKind
+	content  string // display text / tool result body
+	command  string // bShellBlock: the shell command that was run
+	toolName string // bToolCall, bToolResult
+	toolArgs string // bToolCall
+	isErr    bool   // bToolResult / bShellBlock: true = error result
+	// collapsed applies to bThinking and bToolResult.
+	collapsed bool
+	// streaming is true for bAssistant, bThinking, bShellBlock while output is
+	// still arriving; it switches to false when done.
+	streaming bool
 }
+
+// toolResultPreviewLines is the number of lines shown in a collapsed tool result.
+const toolResultPreviewLines = 5
 
 type toolCallMsg struct {
 	name string
@@ -119,24 +157,41 @@ type Model struct {
 	modelName     string
 	systemPrompt  string // injected as first message each turn; "" = none
 
-	input            textinput.Model
-	vp               viewport.Model
-	autoScroll       bool // scroll to bottom whenever new content arrives
-	lines            []string
-	streamCh         chan tea.Msg
-	running          bool
-	cancelTurn       context.CancelFunc // non-nil while a turn is in flight
-	width            int
-	height           int
-	assistantLineIdx int
-	thinkingLineIdx  int    // index of the streaming thinking block; -1 when none
-	thinkingContent  string // raw accumulated thinking text (reset each turn)
-	thinkingBlocks   []thinkingBlock // all finished thinking blocks this session
-	thinkingCollapsed bool           // current collapse state (toggled per-session)
+	input      textinput.Model
+	vp         viewport.Model
+	autoScroll bool // scroll to bottom whenever new content arrives
+
+	// chatBlocks is the source of truth for all displayed content.
+	// lines is its rendered cache: lines[i] = renderBlock(chatBlocks[i]).
+	// They are always kept in strict 1:1 correspondence.
+	chatBlocks []chatBlock
+	lines      []string
+
+	streamCh   chan tea.Msg
+	running    bool
+	cancelTurn context.CancelFunc // non-nil while a turn is in flight
+	width      int
+	height     int
+
+	// Indices into chatBlocks for the currently streaming items; -1 = none.
+	streamingAssistantIdx int
+	streamingThinkingIdx  int
+
+	thinkingCollapsed    bool // global collapse state for thinking blocks
+	toolResultsCollapsed bool // global collapse state for tool results
 	spinner          spinner.Model
 
 	registry     *resources.Registry
 	resourceCmds []commandDef // dynamic commands built from registry + extension commands
+
+	// permission dialog
+	permService permission.Service   // nil when permissions are disabled
+	currentPerm *permission.Request  // non-nil while a permission dialog is active
+
+	shellCh               chan tea.Msg // receives shellOutputMsg / shellDoneMsg from background shell
+	shellBlockIdx         int         // index of the active bShellBlock, -1 = none
+	shellCmdParentNodeID  string      // currentNodeID captured at shell command start, for session recording
+	shellCompletionBase string     // part of input before the path prefix being completed
 
 	mdRenderer  *glamour.TermRenderer // created once at init, before BubbleTea owns stdin
 	mdStyle     string                // "dark" or "light", detected at init
@@ -154,13 +209,67 @@ type Model struct {
 var (
 	headerStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12"))
 	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-	userStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
-	asstStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
+	shellStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("11")) // yellow for shell output
 	metaStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	thinkingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
+
+	toolResultToggleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
+
+	// msgBlockPrefix is the number of terminal columns consumed by the
+	// left border character (1) plus the padding space (1).
+	// This mirrors Crush's MessageLeftPaddingTotal = 2.
+	msgBlockPrefix = 2
+
+	// User block: thick left border, no gap between bar and bg.
+	userBorderPrefix = lipgloss.NewStyle().
+				BorderStyle(lipgloss.ThickBorder()).
+				BorderLeft(true).
+				BorderForeground(lipgloss.Color("60"))
+
+	// Tool status icons — Crush-style single-char status on the header line.
+	toolIconRunning = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).SetString("●")
+	toolIconSuccess = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).SetString("✓")
+	toolIconError   = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).SetString("✗")
+
+	// Tool text styles.
+	toolNameStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
+	toolArgsStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	toolTruncStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
+
+	bgUser  = lipgloss.Color("#131a2e")
+	bgShell = lipgloss.Color("#141414") // near-black for shell blocks
+
+	shellBlockBorderPrefix = lipgloss.NewStyle().
+				BorderStyle(lipgloss.ThickBorder()).
+				BorderLeft(true).
+				BorderForeground(lipgloss.Color("240")) // medium grey
+
+	// permission dialog styles
+	permTitleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))
+	permLabelStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	permValueStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	permBorderStyle  = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("11")).Padding(0, 1)
+	permCodeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Background(lipgloss.Color("235")).Padding(0, 1)
+	permDiffAddStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	permDiffDelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	permAllowStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("10"))
+	permSessionStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11"))
+	permDenyStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9"))
+	permHelpStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
-func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions sessionStore, sessionID string, reg *resources.Registry, rt *luaext.Runtime, statusCh <-chan luaext.StatusUpdate, settings config.Settings, systemPrompt ...string) Model {
+// permRequestMsg is sent to the TUI when a permission request arrives.
+// shellOutputMsg carries a chunk of stdout/stderr from a ! command.
+type shellOutputMsg struct{ text string }
+
+// shellDoneMsg is sent when a ! command exits.
+type shellDoneMsg struct{ err error }
+
+type permRequestMsg struct {
+	req permission.Request
+}
+
+func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions sessionStore, sessionID string, reg *resources.Registry, rt *luaext.Runtime, statusCh <-chan luaext.StatusUpdate, settings config.Settings, perm permission.Service, systemPrompt ...string) Model {
 	in := textinput.New()
 	in.Placeholder = "Ask pigeon..."
 	in.Prompt = "> "
@@ -178,7 +287,7 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 	mdStyle := glamourStyle()
 	mdRenderer, _ := glamour.NewTermRenderer(
 		glamour.WithStandardStyle(mdStyle),
-		glamour.WithWordWrap(80),
+		glamour.WithWordWrap(78), // 80 - msgBlockPrefix(2)
 	)
 
 	sp := spinner.New()
@@ -186,31 +295,35 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 
 	m := Model{
-		agent:            ag,
-		catalog:          catalog,
-		sessions:         sessions,
-		sessionID:        strings.TrimSpace(sessionID),
-		modelName:        strings.TrimSpace(modelName),
-		input:            in,
-		vp:               vp,
-		autoScroll:       true,
-		lines:            introLines(strings.TrimSpace(sessionID), ""),
-		assistantLineIdx:  -1,
-		thinkingLineIdx:   -1,
-		thinkingCollapsed: settings.CollapseThinking,
-		spinner:           sp,
-		mdRenderer:       mdRenderer,
-		mdStyle:          mdStyle,
-		keybindings:      settings.Keybindings,
-		registry:         reg,
-		runtime:          rt,
-		statusCh:         statusCh,
-		statuses:         make(map[string]string),
-		resourceCmds:     buildResourceCmds(reg, rt),
+		agent:                 ag,
+		catalog:               catalog,
+		sessions:              sessions,
+		sessionID:             strings.TrimSpace(sessionID),
+		modelName:             strings.TrimSpace(modelName),
+		input:                 in,
+		vp:                    vp,
+		autoScroll:            true,
+		streamingAssistantIdx: -1,
+		streamingThinkingIdx:  -1,
+		shellBlockIdx:         -1,
+		thinkingCollapsed:     settings.CollapseThinking,
+		spinner:               sp,
+		mdRenderer:            mdRenderer,
+		mdStyle:               mdStyle,
+		keybindings:           settings.Keybindings,
+		registry:              reg,
+		runtime:               rt,
+		statusCh:              statusCh,
+		statuses:              make(map[string]string),
+		resourceCmds:          buildResourceCmds(reg, rt),
+		permService:           perm,
 	}
 	if len(systemPrompt) > 0 {
 		m.systemPrompt = strings.TrimSpace(systemPrompt[0])
 	}
+
+	// Populate intro blocks (shown before any session content).
+	m.appendIntroBlocks(strings.TrimSpace(sessionID), "")
 
 	if m.sessions != nil && m.sessionID != "" {
 		if savedModel, err := m.sessions.GetSessionModel(m.sessionID); err == nil && strings.TrimSpace(savedModel) != "" {
@@ -219,10 +332,12 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 		if messages, nodeID, err := m.sessions.LoadLatestMessages(m.sessionID); err == nil {
 			m.history = append([]openrouter.Message{}, messages...)
 			m.currentNodeID = nodeID
-			m.lines = introLines(m.sessionID, m.currentNodeID)
-			m.lines = append(m.lines, m.renderHistoryLines(messages)...)
+			m.chatBlocks = nil
+			m.lines = nil
+			m.appendIntroBlocks(m.sessionID, m.currentNodeID)
+			m.appendHistoryBlocks(messages)
 		} else {
-			m.lines = append(m.lines, errorStyle.Render("failed to load initial session: "+err.Error()))
+			m.appendBlock(chatBlock{kind: bError, content: "failed to load initial session: " + err.Error()})
 		}
 	}
 
@@ -236,6 +351,9 @@ func (m Model) Init() tea.Cmd {
 			fireEventCmd(m.runtime, luaext.Event{Kind: luaext.EventSessionStart}),
 			waitForStatus(m.statusCh),
 		)
+	}
+	if m.permService != nil {
+		cmds = append(cmds, waitForPermission(m.permService.Subscribe()))
 	}
 	return tea.Batch(cmds...)
 }
@@ -288,12 +406,17 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Width = max(20, ws.Width-4)
 		// Rebuild glamour renderer with the new word-wrap width.
 		// Use WithStandardStyle (not WithAutoStyle) to avoid an OSC 11 query.
+		// Content area = termWidth - msgBlockPrefix (border+padding).
+		// Glamour should wrap at that width so markdown fits cleanly inside blocks.
+		wrapWidth := max(40, m.width-msgBlockPrefix)
 		if r, err := glamour.NewTermRenderer(
 			glamour.WithStandardStyle(m.mdStyle),
-			glamour.WithWordWrap(m.width),
+			glamour.WithWordWrap(wrapWidth),
 		); err == nil {
 			m.mdRenderer = r
 		}
+		// Re-render every block so widths are correct after resize.
+		m.rebuildLines()
 		if m.mode == pickerMode {
 			var cmd tea.Cmd
 			m.picker, cmd = m.picker.Update(ws)
@@ -321,6 +444,9 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.mode == nodePickMode {
 		return m.updateNodePicker(msg)
 	}
+	if m.mode == permissionMode {
+		return m.updatePermission(msg)
+	}
 	return m.updateChat(msg)
 }
 
@@ -332,10 +458,10 @@ func (m Model) updatePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Focus()
 		if m.sessions != nil && m.sessionID != "" {
 			if err := m.sessions.SetSessionModel(m.sessionID, m.modelName); err != nil {
-				m.lines = append(m.lines, errorStyle.Render("failed to persist model: "+err.Error()))
+				m.appendBlock(chatBlock{kind: bError, content: "failed to persist model: " + err.Error()})
 			}
 		}
-		m.lines = append(m.lines, metaStyle.Render("Model set to "+m.modelName))
+		m.appendBlock(chatBlock{kind: bMeta, content: "Model set to " + m.modelName})
 		return m, textinput.Blink
 	case modelPickCanceledMsg:
 		m.mode = chatMode
@@ -354,12 +480,12 @@ func (m Model) updateResumePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = chatMode
 		m.input.Focus()
 		if m.sessions == nil {
-			m.lines = append(m.lines, errorStyle.Render("session store not available"))
+			m.appendBlock(chatBlock{kind: bError, content: "session store not available"})
 			return m, textinput.Blink
 		}
 		messages, nodeID, err := m.sessions.LoadLatestMessages(msg.sessionID)
 		if err != nil {
-			m.lines = append(m.lines, errorStyle.Render("failed to load session: "+err.Error()))
+			m.appendBlock(chatBlock{kind: bError, content: "failed to load session: " + err.Error()})
 			return m, textinput.Blink
 		}
 		m.sessionID = msg.sessionID
@@ -368,13 +494,15 @@ func (m Model) updateResumePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if savedModel, err := m.sessions.GetSessionModel(m.sessionID); err == nil && strings.TrimSpace(savedModel) != "" {
 			m.modelName = savedModel
 		}
-		m.lines = introLines(m.sessionID, m.currentNodeID)
-		m.lines = append(m.lines, m.renderHistoryLines(messages)...)
-		m.lines = append(m.lines, metaStyle.Render(fmt.Sprintf(
+		m.chatBlocks = nil
+		m.lines = nil
+		m.appendIntroBlocks(m.sessionID, m.currentNodeID)
+		m.appendHistoryBlocks(messages)
+		m.appendBlock(chatBlock{kind: bMeta, content: fmt.Sprintf(
 			"Resumed session %s at node %s (%d messages)",
 			m.sessionID, shortID(m.currentNodeID), len(messages),
-		)))
-		m.lines = append(m.lines, metaStyle.Render("Model: "+m.modelName))
+		)})
+		m.appendBlock(chatBlock{kind: bMeta, content: "Model: " + m.modelName})
 		return m, textinput.Blink
 
 	case sessionPickCanceledMsg:
@@ -395,22 +523,24 @@ func (m Model) updateNodePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = chatMode
 		m.input.Focus()
 		if m.sessions == nil {
-			m.lines = append(m.lines, errorStyle.Render("session store not available"))
+			m.appendBlock(chatBlock{kind: bError, content: "session store not available"})
 			return m, textinput.Blink
 		}
 		messages, err := m.sessions.LoadMessagesAtNode(m.sessionID, msg.nodeID)
 		if err != nil {
-			m.lines = append(m.lines, errorStyle.Render("failed to load messages at node: "+err.Error()))
+			m.appendBlock(chatBlock{kind: bError, content: "failed to load messages at node: " + err.Error()})
 			return m, textinput.Blink
 		}
 		m.currentNodeID = msg.nodeID
 		m.history = append([]openrouter.Message{}, messages...)
-		m.lines = introLines(m.sessionID, m.currentNodeID)
-		m.lines = append(m.lines, m.renderHistoryLines(messages)...)
-		m.lines = append(m.lines, metaStyle.Render(fmt.Sprintf(
+		m.chatBlocks = nil
+		m.lines = nil
+		m.appendIntroBlocks(m.sessionID, m.currentNodeID)
+		m.appendHistoryBlocks(messages)
+		m.appendBlock(chatBlock{kind: bMeta, content: fmt.Sprintf(
 			"Checked out node %s (%d messages)",
 			shortID(m.currentNodeID), len(messages),
-		)))
+		)})
 		return m, textinput.Blink
 
 	case nodePickCanceledMsg:
@@ -476,9 +606,17 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case key == m.keybindings.ToggleThinking:
 			m.toggleThinking()
+		case key == m.keybindings.ToggleTools:
+			m.toggleToolResults()
 			return m, nil
 		}
 		switch key {
+		case "tab":
+			// Tab in shell (!) mode: trigger path autocompletion.
+			if !m.running && strings.HasPrefix(m.input.Value(), "!") {
+				m = m.triggerShellCompletion()
+				return m, nil
+			}
 		case "enter":
 			if m.running {
 				return m, nil
@@ -490,9 +628,13 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.SetValue("")
 			m.suggestions = nil
 			m.suggCursor = 0
+			m.shellCompletionBase = ""
 
 			if strings.HasPrefix(value, "/") {
 				return m.handleCommand(value)
+			}
+			if strings.HasPrefix(value, "!") {
+				return m.submitShell(strings.TrimSpace(value[1:]))
 			}
 			return m.submitPrompt(value)
 		}
@@ -504,82 +646,145 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case thinkingTokenMsg:
-		if m.thinkingLineIdx < 0 {
-			m.lines = append(m.lines, "")
-			m.thinkingLineIdx = len(m.lines) - 1
+		if m.streamingThinkingIdx < 0 {
+			m.appendBlock(chatBlock{kind: bSep})
+			m.streamingThinkingIdx = m.appendBlock(chatBlock{kind: bThinking, streaming: true})
 		}
-		m.thinkingContent += msg.token
-		m.lines[m.thinkingLineIdx] = thinkingLine(m.thinkingContent)
+		m.chatBlocks[m.streamingThinkingIdx].content += msg.token
+		m.updateBlock(m.streamingThinkingIdx)
 		return m, waitForStream(m.streamCh)
+
 	case tokenMsg:
-		if m.assistantLineIdx < 0 {
-			// Start a new assistant line (first content token of this round).
-			m.lines = append(m.lines, assistantLine(""))
-			m.assistantLineIdx = len(m.lines) - 1
+		if m.streamingAssistantIdx < 0 {
+			m.appendBlock(chatBlock{kind: bSep})
+			m.streamingAssistantIdx = m.appendBlock(chatBlock{kind: bAssistant, streaming: true})
 		}
-		m.lines[m.assistantLineIdx] += msg.token
+		m.chatBlocks[m.streamingAssistantIdx].content += msg.token
+		m.updateBlock(m.streamingAssistantIdx)
 		return m, waitForStream(m.streamCh)
+
 	case toolCallMsg:
-		// Thinking for this round is done — collapse it.
-		m.collapseThinkingLine()
-		// Reset so the follow-up assistant message starts on its own line.
-		m.assistantLineIdx = -1
-		m.lines = append(m.lines, metaStyle.Render(fmt.Sprintf("↳ tool call: %s(%s)", msg.name, msg.args)))
+		m.collapseThinkingBlock()
+		m.streamingAssistantIdx = -1
+		m.appendBlock(chatBlock{kind: bSep})
+		// streaming=true means "still running"; flipped to false in toolResultMsg.
+		m.appendBlock(chatBlock{kind: bToolCall, toolName: msg.name, toolArgs: msg.args, streaming: true})
 		return m, waitForStream(m.streamCh)
+
 	case toolResultMsg:
+		content := msg.result
 		if msg.err != nil {
-			m.lines = append(m.lines, errorStyle.Render(fmt.Sprintf("↳ tool error (%s): %v", msg.name, msg.err)))
-		} else {
-			m.lines = append(m.lines, metaStyle.Render(fmt.Sprintf("↳ tool result (%s): %s", msg.name, summarize(msg.result))))
+			content = msg.err.Error()
 		}
+		// Update the matching bToolCall header so the icon flips to ✓/✗.
+		for i := len(m.chatBlocks) - 1; i >= 0; i-- {
+			if m.chatBlocks[i].kind == bToolCall && m.chatBlocks[i].toolName == msg.name {
+				m.chatBlocks[i].streaming = false
+				m.chatBlocks[i].isErr = msg.err != nil
+				m.updateBlock(i)
+				break
+			}
+		}
+		m.appendBlock(chatBlock{
+			kind:      bToolResult,
+			toolName:  msg.name,
+			content:   content,
+			isErr:     msg.err != nil,
+			collapsed: m.toolResultsCollapsed,
+		})
 		return m, waitForStream(m.streamCh)
+
 	case turnDoneMsg:
 		m.running = false
 		if m.cancelTurn != nil {
 			m.cancelTurn()
 			m.cancelTurn = nil
 		}
-		m.collapseThinkingLine()
+		m.collapseThinkingBlock()
+		// Finalize the streaming assistant block with glamour-rendered markdown.
+		if m.streamingAssistantIdx >= 0 {
+			final := lastAssistantContent(msg.newMessages)
+			if strings.TrimSpace(final) != "" {
+				m.chatBlocks[m.streamingAssistantIdx].content = final
+			}
+			m.chatBlocks[m.streamingAssistantIdx].streaming = false
+			m.updateBlock(m.streamingAssistantIdx)
+		}
+		m.streamingAssistantIdx = -1
 		if len(msg.newMessages) > 0 {
 			m.history = append(m.history, msg.newMessages...)
 			if m.sessions != nil && m.sessionID != "" {
 				nodeID, err := m.sessions.AppendMessages(m.sessionID, m.currentNodeID, msg.newMessages)
 				if err != nil {
-					m.lines = append(m.lines, errorStyle.Render("session write failed: "+err.Error()))
+					m.appendBlock(chatBlock{kind: bError, content: "session write failed: " + err.Error()})
 				} else {
 					m.currentNodeID = nodeID
 				}
 			}
 		}
-		finalAssistant := lastAssistantContent(msg.newMessages)
-		if m.assistantLineIdx >= 0 && m.assistantLineIdx < len(m.lines) {
-			if strings.TrimSpace(finalAssistant) != "" {
-				m.lines[m.assistantLineIdx] = renderAssistantMarkdown(m.mdRenderer, finalAssistant, m.width)
-			}
-		}
-		m.assistantLineIdx = -1
 		if m.runtime != nil {
 			return m, fireEventCmd(m.runtime, luaext.Event{Kind: luaext.EventTurnEnd})
 		}
 		return m, nil
+
 	case turnErrMsg:
 		m.running = false
-		m.assistantLineIdx = -1
-		m.collapseThinkingLine()
+		m.collapseThinkingBlock()
+		m.streamingAssistantIdx = -1
 		if m.cancelTurn != nil {
 			m.cancelTurn()
 			m.cancelTurn = nil
 		}
 		if errors.Is(msg.err, context.Canceled) {
-			m.lines = append(m.lines, errorStyle.Render("Cancelled."))
+			m.appendBlock(chatBlock{kind: bError, content: "Cancelled."})
 		} else {
-			m.lines = append(m.lines, errorStyle.Render("Error: "+msg.err.Error()))
+			m.appendBlock(chatBlock{kind: bError, content: "Error: " + msg.err.Error()})
 		}
 		return m, nil
+
 	case extCommandDoneMsg:
 		if msg.err != nil {
-			m.lines = append(m.lines, errorStyle.Render("command error: "+msg.err.Error()))
+			m.appendBlock(chatBlock{kind: bError, content: "command error: " + msg.err.Error()})
 		}
+		return m, nil
+
+	case shellOutputMsg:
+		if m.shellBlockIdx >= 0 {
+			m.chatBlocks[m.shellBlockIdx].content += msg.text
+			m.updateBlock(m.shellBlockIdx)
+		}
+		return m, waitForStream(m.shellCh)
+
+	case shellDoneMsg:
+		m.running = false
+		if m.shellBlockIdx >= 0 {
+			block := m.chatBlocks[m.shellBlockIdx]
+			m.chatBlocks[m.shellBlockIdx].streaming = false
+			if msg.err != nil {
+				m.chatBlocks[m.shellBlockIdx].isErr = true
+			}
+			m.updateBlock(m.shellBlockIdx)
+			// Persist the shell command + its full output as a single "cmd" node.
+			if m.sessions != nil && m.sessionID != "" {
+				content := "!" + block.command
+				if strings.TrimSpace(block.content) != "" {
+					content += "\n" + block.content
+				}
+				cmdMsg := openrouter.Message{Role: "cmd", Content: content}
+				if newNodeID, err := m.sessions.AppendMessages(m.sessionID, m.shellCmdParentNodeID, []openrouter.Message{cmdMsg}); err == nil {
+					m.currentNodeID = newNodeID
+				}
+			}
+			m.shellBlockIdx = -1
+		} else if msg.err != nil {
+			m.appendBlock(chatBlock{kind: bError, content: "! " + msg.err.Error()})
+		}
+		return m, nil
+
+	case permRequestMsg:
+		m.currentPerm = &msg.req
+		m.mode = permissionMode
+		m.input.Blur()
 		return m, nil
 	}
 
@@ -594,15 +799,35 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateSuggestions() Model {
 	val := m.input.Value()
+
+	// Colour the prompt and text based on the leading character so the user
+	// always knows which mode they're in:
+	//   !  yellow — shell passthrough
+	//   /  cyan   — slash command
+	//   default   — normal (no override)
+	switch {
+	case strings.HasPrefix(val, "!"):
+		m.input.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+		m.input.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	case strings.HasPrefix(val, "/"):
+		m.input.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+		m.input.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	default:
+		m.input.PromptStyle = lipgloss.NewStyle()
+		m.input.TextStyle = lipgloss.NewStyle()
+	}
+
 	// Show suggestions only when typing a command name (starts with / but no space yet).
 	if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
 		m.suggestions = filterCommands(val, m.resourceCmds)
 		if m.suggCursor >= len(m.suggestions) {
 			m.suggCursor = max(0, len(m.suggestions)-1)
 		}
+		m.shellCompletionBase = ""
 	} else {
 		m.suggestions = nil
 		m.suggCursor = 0
+		m.shellCompletionBase = ""
 	}
 	return m
 }
@@ -611,6 +836,11 @@ func (m Model) applySuggestion() Model {
 	if len(m.suggestions) == 0 || m.suggCursor >= len(m.suggestions) {
 		return m
 	}
+	// Path completion for shell (!) mode.
+	if m.shellCompletionBase != "" {
+		return m.applyPathSuggestion()
+	}
+	// Command completion.
 	chosen := m.suggestions[m.suggCursor]
 	if chosen.args != "" {
 		m.input.SetValue(chosen.name + " ")
@@ -623,21 +853,102 @@ func (m Model) applySuggestion() Model {
 	return m
 }
 
+// applyPathSuggestion applies the currently selected path suggestion in shell (!) mode.
+func (m Model) applyPathSuggestion() Model {
+	if len(m.suggestions) == 0 || m.suggCursor >= len(m.suggestions) {
+		return m
+	}
+	chosen := m.suggestions[m.suggCursor]
+	val := m.input.Value()
+	pos := m.input.Position()
+	textAfter := val[pos:]
+
+	newVal := m.shellCompletionBase + chosen.name + textAfter
+	m.input.SetValue(newVal)
+	m.input.CursorEnd()
+
+	// If the chosen path is a directory, re-trigger completion so the user
+	// can keep navigating into sub-directories.
+	if strings.HasSuffix(chosen.name, "/") {
+		m.suggestions = nil
+		m.suggCursor = 0
+		return m.triggerShellCompletion()
+	}
+	m.shellCompletionBase = ""
+	m.suggestions = nil
+	m.suggCursor = 0
+	return m
+}
+
+// triggerShellCompletion extracts the path prefix from the current shell (!)
+// input and populates m.suggestions with file/directory completions.
+func (m Model) triggerShellCompletion() Model {
+	val := m.input.Value()
+	if !strings.HasPrefix(val, "!") {
+		return m
+	}
+	pos := m.input.Position()
+	textBefore := val[:pos]
+	shellText := textBefore[1:] // strip leading '!'
+
+	// Find the start of the last whitespace-delimited token.
+	lastSep := strings.LastIndexAny(shellText, " \t")
+	var pathPrefix, base string
+	if lastSep >= 0 {
+		pathPrefix = shellText[lastSep+1:]
+		base = "!" + shellText[:lastSep+1]
+	} else {
+		pathPrefix = shellText
+		base = "!"
+	}
+
+	completions := getPathCompletions(pathPrefix)
+	if len(completions) == 0 {
+		return m
+	}
+
+	// Single match: apply it directly without showing the dropdown.
+	if len(completions) == 1 {
+		textAfter := val[pos:]
+		m.input.SetValue(base + completions[0].name + textAfter)
+		m.input.CursorEnd()
+		// Re-enter sub-directory automatically.
+		if strings.HasSuffix(completions[0].name, "/") {
+			m.shellCompletionBase = ""
+			return m.triggerShellCompletion()
+		}
+		m.shellCompletionBase = ""
+		return m
+	}
+
+	m.shellCompletionBase = base
+	m.suggestions = completions
+	m.suggCursor = 0
+	return m
+}
+
 func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 	if m.agent == nil {
-		m.lines = append(m.lines, errorStyle.Render("Error: agent not initialized"))
+		m.appendBlock(chatBlock{kind: bError, content: "Error: agent not initialized"})
 		return m, nil
 	}
 
-	m.lines = append(m.lines, userLine(value))
-	m.assistantLineIdx = -1
-	m.thinkingLineIdx = -1
-	m.thinkingContent = ""
+	m.appendBlock(chatBlock{kind: bSep})
+	m.appendBlock(chatBlock{kind: bUser, content: value})
+	m.streamingAssistantIdx = -1
+	m.streamingThinkingIdx = -1
 	m.running = true
 	m.streamCh = make(chan tea.Msg, 128)
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelTurn = cancel
-	history := append([]openrouter.Message{}, m.history...)
+	// Build LLM history, excluding "cmd" nodes (shell commands recorded for
+	// display purposes only — they are not part of the model conversation).
+	history := make([]openrouter.Message, 0, len(m.history))
+	for _, msg := range m.history {
+		if msg.Role != "cmd" {
+			history = append(history, msg)
+		}
+	}
 	// Prepend system prompt as first message each turn (not persisted to session).
 	if sp := strings.TrimSpace(m.systemPrompt); sp != "" {
 		history = append([]openrouter.Message{{Role: "system", Content: sp}}, history...)
@@ -645,6 +956,11 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 	rt := m.runtime // capture pointer; safe to call from agent goroutine
 
 	go func(ctx context.Context, ch chan<- tea.Msg, input, modelName string, hist []openrouter.Message) {
+		// Inject session ID so tools can associate permission requests with
+		// the correct conversation.
+		if m.sessionID != "" {
+			ctx = permission.ContextWithSessionID(ctx, m.sessionID)
+		}
 		newMessages, err := m.agent.RunTurn(ctx, modelName, hist, input, agent.TurnCallbacks{
 			OnToken: func(token string) {
 				ch <- tokenMsg{token: token}
@@ -712,15 +1028,15 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			m.modelName = id
 			if m.sessions != nil && m.sessionID != "" {
 				if err := m.sessions.SetSessionModel(m.sessionID, m.modelName); err != nil {
-					m.lines = append(m.lines, errorStyle.Render("failed to persist model: "+err.Error()))
+					m.appendBlock(chatBlock{kind: bError, content: "failed to persist model: "+err.Error()})
 				}
 			}
-			m.lines = append(m.lines, metaStyle.Render("Model set to "+m.modelName))
+			m.appendBlock(chatBlock{kind: bMeta, content: "Model set to "+m.modelName})
 			return m, nil
 		}
 		// Open interactive picker.
 		if m.catalog == nil {
-			m.lines = append(m.lines, errorStyle.Render("model catalog not available"))
+			m.appendBlock(chatBlock{kind: bError, content: "model catalog not available"})
 			return m, nil
 		}
 		m.mode = pickerMode
@@ -738,12 +1054,12 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 
 	case "/new":
 		if m.sessions == nil {
-			m.lines = append(m.lines, errorStyle.Render("Session store not available"))
+			m.appendBlock(chatBlock{kind: bError, content: "Session store not available"})
 			return m, nil
 		}
 		sessionID, err := m.sessions.NewSession()
 		if err != nil {
-			m.lines = append(m.lines, errorStyle.Render("Failed to create session: "+err.Error()))
+			m.appendBlock(chatBlock{kind: bError, content: "Failed to create session: "+err.Error()})
 			return m, nil
 		}
 		m.sessionID = sessionID
@@ -751,16 +1067,18 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 		m.history = nil
 		if m.sessions != nil && m.modelName != "" {
 			if err := m.sessions.SetSessionModel(m.sessionID, m.modelName); err != nil {
-				m.lines = append(m.lines, errorStyle.Render("Failed to persist session model: "+err.Error()))
+				m.appendBlock(chatBlock{kind: bError, content: "Failed to persist session model: "+err.Error()})
 			}
 		}
-		m.lines = introLines(m.sessionID, m.currentNodeID)
-		m.lines = append(m.lines, metaStyle.Render("Started new session: "+m.sessionID))
+		m.chatBlocks = nil
+		m.lines = nil
+		m.appendIntroBlocks(m.sessionID, m.currentNodeID)
+		m.appendBlock(chatBlock{kind: bMeta, content: "Started new session: " + m.sessionID})
 		return m, nil
 
 	case "/sessions":
 		if m.sessions == nil {
-			m.lines = append(m.lines, errorStyle.Render("Session store not available"))
+			m.appendBlock(chatBlock{kind: bError, content: "Session store not available"})
 			return m, nil
 		}
 		// Always open interactive picker.
@@ -778,11 +1096,11 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 
 	case "/label":
 		if m.sessions == nil {
-			m.lines = append(m.lines, errorStyle.Render("Session store not available"))
+			m.appendBlock(chatBlock{kind: bError, content: "Session store not available"})
 			return m, nil
 		}
 		if m.sessionID == "" {
-			m.lines = append(m.lines, errorStyle.Render("No active session"))
+			m.appendBlock(chatBlock{kind: bError, content: "No active session"})
 			return m, nil
 		}
 		label := strings.Join(parts[1:], " ")
@@ -790,35 +1108,35 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			// Show current label.
 			current, err := m.sessions.GetSessionLabel(m.sessionID)
 			if err != nil {
-				m.lines = append(m.lines, errorStyle.Render("Failed to read label: "+err.Error()))
+				m.appendBlock(chatBlock{kind: bError, content: "Failed to read label: "+err.Error()})
 				return m, nil
 			}
 			if current == "" {
-				m.lines = append(m.lines, metaStyle.Render("No label set. Use /label <text> to set one."))
+				m.appendBlock(chatBlock{kind: bMeta, content: "No label set. Use /label <text> to set one."})
 			} else {
-				m.lines = append(m.lines, metaStyle.Render("Label: "+current))
+				m.appendBlock(chatBlock{kind: bMeta, content: "Label: "+current})
 			}
 			return m, nil
 		}
 		if err := m.sessions.SetSessionLabel(m.sessionID, label); err != nil {
-			m.lines = append(m.lines, errorStyle.Render("Failed to set label: "+err.Error()))
+			m.appendBlock(chatBlock{kind: bError, content: "Failed to set label: "+err.Error()})
 			return m, nil
 		}
-		m.lines = append(m.lines, metaStyle.Render("Session labelled: "+label))
+		m.appendBlock(chatBlock{kind: bMeta, content: "Session labelled: "+label})
 		return m, nil
 
 	case "/system":
 		text := strings.Join(parts[1:], " ")
 		if text == "" {
 			if m.systemPrompt == "" {
-				m.lines = append(m.lines, metaStyle.Render("No system prompt set. Use /system <text> to set one."))
+				m.appendBlock(chatBlock{kind: bMeta, content: "No system prompt set. Use /system <text> to set one."})
 			} else {
-				m.lines = append(m.lines, metaStyle.Render("System prompt: "+m.systemPrompt))
+				m.appendBlock(chatBlock{kind: bMeta, content: "System prompt: "+m.systemPrompt})
 			}
 			return m, nil
 		}
 		m.systemPrompt = strings.TrimSpace(text)
-		m.lines = append(m.lines, metaStyle.Render("System prompt updated."))
+		m.appendBlock(chatBlock{kind: bMeta, content: "System prompt updated."})
 		return m, nil
 
 	case "/keybinds":
@@ -828,6 +1146,7 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			{kb.Quit, "quit pigeon"},
 			{kb.CancelTurn, "cancel running assistant turn"},
 			{kb.ToggleThinking, "toggle thinking blocks"},
+			{kb.ToggleTools, "toggle tool result blocks"},
 		}
 		// measure longest key for alignment
 		maxLen := 0
@@ -837,29 +1156,29 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			}
 		}
 		keyStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14"))
-		m.lines = append(m.lines, metaStyle.Render("Keybindings:"))
+		m.appendBlock(chatBlock{kind: bMeta, content: "Keybindings:"})
 		for _, e := range entries {
 			pad := strings.Repeat(" ", maxLen-len(e.key))
-			m.lines = append(m.lines, "  "+keyStyle.Render(e.key)+pad+"  "+e.action)
+			m.appendBlock(chatBlock{kind: bMeta, content: "  " + keyStyle.Render(e.key) + pad + "  " + e.action})
 		}
 		return m, nil
 
 	case "/tree":
 		if m.sessions == nil {
-			m.lines = append(m.lines, errorStyle.Render("Session store not available"))
+			m.appendBlock(chatBlock{kind: bError, content: "Session store not available"})
 			return m, nil
 		}
 		if m.sessionID == "" {
-			m.lines = append(m.lines, metaStyle.Render("No active session. Use /resume first."))
+			m.appendBlock(chatBlock{kind: bMeta, content: "No active session. Use /resume first."})
 			return m, nil
 		}
 		nodes, err := m.sessions.ListNodes(m.sessionID)
 		if err != nil {
-			m.lines = append(m.lines, errorStyle.Render("Failed to load tree: "+err.Error()))
+			m.appendBlock(chatBlock{kind: bError, content: "Failed to load tree: "+err.Error()})
 			return m, nil
 		}
 		if len(nodes) == 0 {
-			m.lines = append(m.lines, metaStyle.Render("Session tree is empty"))
+			m.appendBlock(chatBlock{kind: bMeta, content: "Session tree is empty"})
 			return m, nil
 		}
 		w, h := m.width, m.height
@@ -881,22 +1200,22 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 		if strings.HasPrefix(cmd, "/skill:") {
 			skillName := strings.TrimPrefix(cmd, "/skill:")
 			if m.registry == nil {
-				m.lines = append(m.lines, errorStyle.Render("no resource registry loaded"))
+				m.appendBlock(chatBlock{kind: bError, content: "no resource registry loaded"})
 				return m, nil
 			}
 			skill, ok := m.registry.GetSkill(skillName)
 			if !ok {
-				m.lines = append(m.lines, errorStyle.Render("skill not found: "+skillName))
+				m.appendBlock(chatBlock{kind: bError, content: "skill not found: "+skillName})
 				return m, nil
 			}
 			sysMsg := openrouter.Message{Role: "system", Content: skill.Content}
 			m.history = append(m.history, sysMsg)
 			if m.sessions != nil && m.sessionID != "" {
 				if _, err := m.sessions.AppendMessages(m.sessionID, m.currentNodeID, []openrouter.Message{sysMsg}); err != nil {
-					m.lines = append(m.lines, errorStyle.Render("session write failed: "+err.Error()))
+					m.appendBlock(chatBlock{kind: bError, content: "session write failed: "+err.Error()})
 				}
 			}
-			m.lines = append(m.lines, metaStyle.Render("skill loaded: "+skillName))
+			m.appendBlock(chatBlock{kind: bMeta, content: "skill loaded: "+skillName})
 			return m, nil
 		}
 
@@ -919,7 +1238,7 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		m.lines = append(m.lines, errorStyle.Render("unknown command: "+cmd))
+		m.appendBlock(chatBlock{kind: bError, content: "unknown command: "+cmd})
 		return m, nil
 	}
 }
@@ -940,6 +1259,24 @@ func (m Model) View() string {
 	return m.viewChat(header)
 }
 
+// viewChatWithPermDialog renders the chat view with the permission dialog
+// replacing the normal input at the bottom.
+func (m Model) viewChatWithPermDialog(header string) string {
+	var statusLine string
+	below := m.vp.TotalLineCount() - m.vp.YOffset - m.vp.Height
+	if below > 0 {
+		statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more  ", below))
+	}
+	if m.running && statusLine == "" {
+		statusLine = m.spinner.View()
+	}
+	if statusLine == "" {
+		statusLine = " "
+	}
+	dialog := m.renderPermDialog()
+	return lipgloss.JoinVertical(lipgloss.Left, header, "", m.vp.View(), statusLine, dialog)
+}
+
 func (m Model) renderHeader() string {
 	status := "idle"
 	if m.running {
@@ -954,6 +1291,9 @@ func (m Model) renderHeader() string {
 	if m.mode == nodePickMode {
 		status = "picking node"
 	}
+	if m.mode == permissionMode {
+		status = "awaiting permission"
+	}
 	sessionText := "none"
 	if m.sessionID != "" {
 		sessionText = m.sessionID
@@ -966,6 +1306,9 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) viewChat(header string) string {
+	if m.mode == permissionMode {
+		return m.viewChatWithPermDialog(header)
+	}
 	// One reserved line between viewport and input: spinner while running,
 	// scroll indicator when scrolled up, blank otherwise.
 	var statusLine string
@@ -1020,29 +1363,41 @@ func (m Model) renderStatusBar() string {
 }
 
 func (m Model) renderSuggestions() string {
-	var b strings.Builder
-	for i, cmd := range m.suggestions {
-		selected := i == m.suggCursor
+	// Limit visible suggestions to avoid overwhelming the input area.
+	const maxVisible = 10
+	suggestions := m.suggestions
+	if len(suggestions) > maxVisible {
+		suggestions = suggestions[:maxVisible]
+	}
 
-		label := cmd.name
-		if cmd.args != "" {
-			label += " " + suggDimStyle.Render(cmd.args)
-		}
-		desc := suggDimStyle.Render("  — " + cmd.desc)
+	var b strings.Builder
+	for i, cmd := range suggestions {
+		selected := i == m.suggCursor
 
 		if selected {
 			b.WriteString(suggSelectedStyle.Render("▶ " + cmd.name))
 			if cmd.args != "" {
 				b.WriteString(suggSelectedDimStyle.Render(" " + cmd.args))
 			}
-			b.WriteString(suggSelectedDimStyle.Render("  — " + cmd.desc))
+			if cmd.desc != "" {
+				b.WriteString(suggSelectedDimStyle.Render("  — " + cmd.desc))
+			}
 		} else {
-			b.WriteString("  " + label + desc)
+			label := cmd.name
+			if cmd.args != "" {
+				label += " " + suggDimStyle.Render(cmd.args)
+			}
+			if cmd.desc != "" {
+				label += suggDimStyle.Render("  — " + cmd.desc)
+			}
+			b.WriteString("  " + label)
 		}
 		b.WriteString("\n")
 	}
-	out := strings.TrimRight(b.String(), "\n")
-	return out
+	if len(m.suggestions) > maxVisible {
+		b.WriteString(suggDimStyle.Render(fmt.Sprintf("  … %d more", len(m.suggestions)-maxVisible)) + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────────
@@ -1051,9 +1406,29 @@ func (m Model) renderSuggestions() string {
 // scroll indicator, suggestions, input, optional status bar) and scrolls to the
 // bottom when autoScroll is true.
 func (m Model) recalcViewport() Model {
-	chrome := 4 + len(m.suggestions) // header(1) + blank(1) + scrollLine(1) + input(1)
-	if len(m.statuses) > 0 {
-		chrome++ // status bar
+	// Compute the actual number of terminal lines the header occupies.
+	// headerStyle has no Width set, so lipgloss emits a single unsplit string
+	// and the terminal wraps it.  We simulate that wrap here so the viewport
+	// height is always accurate regardless of terminal width.
+	headerLines := 1
+	if m.width > 0 {
+		headerLines = max(1, (lipgloss.Width(m.renderHeader())+m.width-1)/m.width)
+	}
+
+	var chrome int
+	if m.mode == permissionMode {
+		// header + blank(1) + scrollLine(1) + dialog
+		chrome = headerLines + 1 + 1 + permDialogChrome - 1
+	} else {
+		// header + blank(1) + scrollLine(1) + input(1)
+		visibleSuggs := len(m.suggestions)
+		if visibleSuggs > 10 {
+			visibleSuggs = 10 + 1 // +1 for the "… N more" line
+		}
+		chrome = headerLines + 3 + visibleSuggs
+		if len(m.statuses) > 0 {
+			chrome++ // status bar
+		}
 	}
 	m.vp.Width = m.width
 	m.vp.Height = max(3, m.height-chrome)
@@ -1086,22 +1461,7 @@ func waitForStream(ch <-chan tea.Msg) tea.Cmd {
 	}
 }
 
-func introLines(sessionID, nodeID string) []string {
-	lines := []string{"Welcome to pigeon.", "Type /quit to exit."}
-	if sessionID != "" {
-		lines = append(lines, metaStyle.Render("Session: "+sessionID))
-	}
-	if nodeID != "" {
-		lines = append(lines, metaStyle.Render("Node: "+shortID(nodeID)))
-	}
-	return lines
-}
-
-// glamourStyle returns the glamour style name to use. It respects the
-// GLAMOUR_STYLE env var (e.g. "dark", "light", "dracula") and falls back to
-// "dark". We deliberately avoid WithAutoStyle() here because that sends an
-// OSC 11 terminal colour query; if that query fires after BubbleTea has taken
-// over stdin the terminal's response lands in the input field as garbage text.
+// glamourStyle returns the glamour style name to use.
 func glamourStyle() string {
 	if s := strings.TrimSpace(os.Getenv("GLAMOUR_STYLE")); s != "" {
 		return s
@@ -1109,60 +1469,324 @@ func glamourStyle() string {
 	return "dark"
 }
 
-func userLine(content string) string { return userStyle.Render("You:") + " " + content }
+// ── chatBlock rendering ───────────────────────────────────────────────────────
+//
+// Crush-inspired approach: render the CONTENT at contentWidth (= termWidth - 2),
+// then prepend a coloured border glyph to EVERY line of the output.
+//
+// This avoids lipgloss Width() semantics entirely for block sizing:
+//   - no interaction between Width, Padding, and Border to reason about
+//   - background fills exactly contentWidth columns per line
+//   - border is always exactly 1 column, prepended to each line
+//   - correct on any terminal width, including before WindowSizeMsg
 
-// thinkingLine renders streaming thinking/reasoning content in a dim italic style.
-func thinkingLine(content string) string {
-	return thinkingStyle.Render("💭 " + content)
+// contentWidth returns the number of columns available for message content.
+// msgBlockPrefix (2) = border glyph (1) + padding space (1).
+func contentWidth(termWidth int) int {
+	if termWidth <= msgBlockPrefix {
+		return 20 // safe fallback before WindowSizeMsg arrives
+	}
+	return termWidth - msgBlockPrefix
 }
 
-// collapseThinkingLine finalises the current streaming thinking block: it
-// stores it in thinkingBlocks and renders it according to thinkingCollapsed.
-func (m *Model) collapseThinkingLine() {
-	if m.thinkingLineIdx < 0 || m.thinkingLineIdx >= len(m.lines) {
-		m.thinkingLineIdx = -1
-		m.thinkingContent = ""
+// prefixEachLine prepends prefix to every line of s.
+func prefixEachLine(prefix, s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+	return strings.Join(lines, "\n")
+}
+
+// applyBackground pads every line of content to width cols and applies bg.
+// This gives each block a consistent rectangular background without using
+// lipgloss Width() on the outer container.
+func applyBackground(content string, bg lipgloss.Color, width int) string {
+	bgStyle := lipgloss.NewStyle().Background(bg).Width(width)
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		lines[i] = bgStyle.Render(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// stripBlankLines removes blank (whitespace-only) lines from s.
+// Glamour adds blank lines between elements for readability; inside bordered
+// blocks those blank lines, after applyBackground, produce full-width
+// background-coloured rectangles that look like solid bars / black squares.
+func stripBlankLines(s string) string {
+	lines := strings.Split(s, "\n")
+	out := lines[:0]
+	for _, l := range lines {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// renderBlock renders a single chatBlock to a string using the current terminal width.
+func (m Model) renderBlock(b chatBlock) string {
+	cw := contentWidth(m.width)
+	switch b.kind {
+	case bSep:
+		return ""
+	case bMeta:
+		return metaStyle.Render(b.content)
+	case bError:
+		return errorStyle.Render(b.content)
+	case bShell:
+		return shellStyle.Render(b.content)
+	case bShellBlock:
+		// Shell command + output rendered exactly like a user message (same bg and border)
+		// but with a monospace command header and dimmed output text.
+		padLine := lipgloss.NewStyle().Background(bgShell).Width(cw).Render("")
+		blankLine := lipgloss.NewStyle().Background(bgShell).PaddingLeft(2).Width(cw).Render("")
+
+		// Status icon appended to the command header.
+		var statusMark string
+		switch {
+		case b.streaming:
+			statusMark = "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("●")
+		case b.isErr:
+			statusMark = "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render("✗")
+		default:
+			statusMark = "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Render("✓")
+		}
+		cmdStyle := lipgloss.NewStyle().
+			Background(bgShell).PaddingLeft(2).Width(cw).
+			Foreground(lipgloss.Color("15")).Bold(true)
+		outputStyle := lipgloss.NewStyle().
+			Background(bgShell).PaddingLeft(2).Width(cw).
+			Foreground(lipgloss.Color("8"))
+
+		var contentLines []string
+		contentLines = append(contentLines, padLine)
+		contentLines = append(contentLines, cmdStyle.Render("$ "+b.command+statusMark))
+		if b.content != "" {
+			contentLines = append(contentLines, blankLine) // space between cmd and output
+			for _, line := range strings.Split(strings.TrimRight(b.content, "\n"), "\n") {
+				contentLines = append(contentLines, outputStyle.Render(line))
+			}
+		}
+		contentLines = append(contentLines, padLine)
+		prefix := shellBlockBorderPrefix.Render()
+		return prefixEachLine(prefix, strings.Join(contentLines, "\n"))
+	case bUser:
+		// Padding line: full-width background-coloured empty row for top/bottom spacing.
+		padLine := lipgloss.NewStyle().Background(bgUser).Width(cw).Render("")
+		// Content lines: left-padded inside the background so text breathes.
+		// PaddingLeft(2) means text starts 2 cols in; Width(cw) keeps total width consistent.
+		lineStyle := lipgloss.NewStyle().Background(bgUser).PaddingLeft(2).Width(cw)
+		var contentLines []string
+		contentLines = append(contentLines, padLine)
+		for _, line := range strings.Split(b.content, "\n") {
+			contentLines = append(contentLines, lineStyle.Render(line))
+		}
+		contentLines = append(contentLines, padLine)
+		prefix := userBorderPrefix.Render()
+		return prefixEachLine(prefix, strings.Join(contentLines, "\n"))
+	case bAssistant:
+		// No border, no background — plain glamour output flows directly into
+		// the viewport so it reads like natural terminal text.
+		if b.streaming {
+			return b.content
+		}
+		return stripBlankLines(m.renderMarkdown(b.content, cw))
+	case bThinking:
+		var text string
+		if b.streaming {
+			text = thinkingStyle.Render("💭 " + b.content)
+		} else if b.collapsed {
+			text = metaStyle.Render("💭 [thinking]")
+		} else {
+			text = thinkingStyle.Render("💭 " + b.content)
+		}
+		return text
+	case bToolCall:
+		// Header line: icon (updates when result arrives) + name + args.
+		var icon string
+		switch {
+		case b.streaming:
+			icon = toolIconRunning.Render()
+		case b.isErr:
+			icon = toolIconError.Render()
+		default:
+			icon = toolIconSuccess.Render()
+		}
+		line := icon + " " + toolNameStyle.Render(b.toolName)
+		if b.toolArgs != "" && b.toolArgs != "{}" {
+			line += "  " + toolArgsStyle.Render(b.toolArgs)
+		}
+		return line
+
+	case bToolResult:
+		// Body only — the bToolCall above already shows the header.
+		if b.content == "" {
+			return ""
+		}
+		raw := strings.TrimRight(b.content, "\n")
+		lines := strings.Split(raw, "\n")
+
+		lineStyle := lipgloss.NewStyle().PaddingLeft(2)
+
+		maxLines := len(lines)
+		if b.collapsed {
+			maxLines = toolResultPreviewLines
+		}
+
+		var out []string
+		for i, l := range lines {
+			if i >= maxLines {
+				break
+			}
+			out = append(out, lineStyle.Render(l))
+		}
+
+		if b.collapsed && len(lines) > toolResultPreviewLines {
+			out = append(out, toolTruncStyle.Render(fmt.Sprintf(
+				"  … %d more lines  [alt+r to expand]", len(lines)-toolResultPreviewLines,
+			)))
+		} else if !b.collapsed && len(lines) > toolResultPreviewLines {
+			out = append(out, toolTruncStyle.Render("  [alt+r to collapse]"))
+		}
+		return strings.Join(out, "\n")
+	}
+	return ""
+}
+
+// renderMarkdown runs content through glamour and trims the surrounding
+// newlines that glamour always adds.
+func (m Model) renderMarkdown(content string, width int) string {
+	if m.mdRenderer == nil || width <= 0 {
+		return content
+	}
+	rendered, err := m.mdRenderer.Render(content)
+	if err != nil {
+		return content
+	}
+	return strings.Trim(rendered, "\n")
+}
+
+// ── chatBlock management ──────────────────────────────────────────────────────
+
+// appendBlock renders b, appends it to chatBlocks and lines, and returns its index.
+func (m *Model) appendBlock(b chatBlock) int {
+	idx := len(m.chatBlocks)
+	m.chatBlocks = append(m.chatBlocks, b)
+	m.lines = append(m.lines, m.renderBlock(b))
+	return idx
+}
+
+// updateBlock re-renders chatBlocks[idx] and updates lines[idx] in-place.
+func (m *Model) updateBlock(idx int) {
+	if idx < 0 || idx >= len(m.chatBlocks) {
 		return
 	}
-	block := thinkingBlock{lineIdx: m.thinkingLineIdx, content: m.thinkingContent}
-	m.thinkingBlocks = append(m.thinkingBlocks, block)
-	m.lines[block.lineIdx] = renderThinkingBlock(block.content, m.thinkingCollapsed)
-	m.thinkingLineIdx = -1
-	m.thinkingContent = ""
+	m.lines[idx] = m.renderBlock(m.chatBlocks[idx])
 }
 
-// toggleThinking flips thinkingCollapsed and re-renders every finished block.
-func (m *Model) toggleThinking() {
-	m.thinkingCollapsed = !m.thinkingCollapsed
-	for _, b := range m.thinkingBlocks {
-		if b.lineIdx >= 0 && b.lineIdx < len(m.lines) {
-			m.lines[b.lineIdx] = renderThinkingBlock(b.content, m.thinkingCollapsed)
+// rebuildLines re-renders every block from scratch using the current width.
+// Called after a terminal resize or glamour renderer change.
+func (m *Model) rebuildLines() {
+	for i := range m.chatBlocks {
+		m.lines[i] = m.renderBlock(m.chatBlocks[i])
+	}
+}
+
+// appendIntroBlocks populates the welcome banner blocks.
+func (m *Model) appendIntroBlocks(sessionID, nodeID string) {
+	m.appendBlock(chatBlock{kind: bMeta, content: "Welcome to pigeon."})
+	m.appendBlock(chatBlock{kind: bMeta, content: "Type /quit to exit."})
+	if sessionID != "" {
+		m.appendBlock(chatBlock{kind: bMeta, content: "Session: " + sessionID})
+	}
+	if nodeID != "" {
+		m.appendBlock(chatBlock{kind: bMeta, content: "Node: " + shortID(nodeID)})
+	}
+}
+
+// appendHistoryBlocks converts loaded session messages into chatBlocks.
+func (m *Model) appendHistoryBlocks(messages []openrouter.Message) {
+	for _, msg := range messages {
+		switch msg.Role {
+		case "user":
+			if strings.TrimSpace(msg.Content) != "" {
+				m.appendBlock(chatBlock{kind: bSep})
+				m.appendBlock(chatBlock{kind: bUser, content: msg.Content})
+			}
+		case "assistant":
+			if strings.TrimSpace(msg.Content) != "" {
+				m.appendBlock(chatBlock{kind: bSep})
+				// streaming: false → renderBlock will use glamour
+				m.appendBlock(chatBlock{kind: bAssistant, content: msg.Content})
+			}
+			for _, tc := range msg.ToolCalls {
+				m.appendBlock(chatBlock{kind: bSep})
+				// streaming=false: result already exists in history.
+				m.appendBlock(chatBlock{kind: bToolCall, toolName: tc.Function.Name, toolArgs: tc.Function.Arguments, streaming: false})
+			}
+		case "tool":
+			name := msg.Name
+			if strings.TrimSpace(name) == "" {
+				name = "tool"
+			}
+			m.appendBlock(chatBlock{kind: bSep})
+			m.appendBlock(chatBlock{
+				kind:      bToolResult,
+				toolName:  name,
+				content:   msg.Content,
+				collapsed: m.toolResultsCollapsed,
+			})
+		case "cmd":
+			// Content format: "!<command>\n<output>" — output may be absent.
+			raw := msg.Content
+			if !strings.HasPrefix(raw, "!") {
+				break
+			}
+			raw = strings.TrimPrefix(raw, "!")
+			command, output, _ := strings.Cut(raw, "\n")
+			if command != "" {
+				m.appendBlock(chatBlock{kind: bSep})
+				m.appendBlock(chatBlock{kind: bShellBlock, command: command, content: output, streaming: false})
+			}
 		}
 	}
 }
 
-// renderThinkingBlock returns the line text for a finished thinking block.
-func renderThinkingBlock(content string, collapsed bool) string {
-	if collapsed {
-		return metaStyle.Render("💭 [thinking]")
+// collapseThinkingBlock finalises the streaming thinking block.
+func (m *Model) collapseThinkingBlock() {
+	if m.streamingThinkingIdx < 0 {
+		return
 	}
-	return thinkingLine(content)
+	m.chatBlocks[m.streamingThinkingIdx].streaming = false
+	m.chatBlocks[m.streamingThinkingIdx].collapsed = m.thinkingCollapsed
+	m.updateBlock(m.streamingThinkingIdx)
+	m.streamingThinkingIdx = -1
 }
-func assistantLine(content string) string { return asstStyle.Render("Assistant:") + " " + content }
 
-// renderAssistantMarkdown renders content through glamour and prepends the
-// styled "Assistant:" label. Falls back to plain assistantLine on error.
-// r must not be nil; it is the pre-initialised renderer stored on the Model.
-func renderAssistantMarkdown(r *glamour.TermRenderer, content string, width int) string {
-	if r == nil || width <= 0 {
-		return assistantLine(content)
+// toggleThinking flips thinkingCollapsed and re-renders every finished thinking block.
+func (m *Model) toggleThinking() {
+	m.thinkingCollapsed = !m.thinkingCollapsed
+	for i := range m.chatBlocks {
+		if m.chatBlocks[i].kind == bThinking && !m.chatBlocks[i].streaming {
+			m.chatBlocks[i].collapsed = m.thinkingCollapsed
+			m.updateBlock(i)
+		}
 	}
-	rendered, err := r.Render(content)
-	if err != nil {
-		return assistantLine(content)
-	}
-	return asstStyle.Render("Assistant:") + "\n" + strings.TrimRight(rendered, "\n")
 }
+
+// toggleToolResults flips toolResultsCollapsed and re-renders every tool result block.
+func (m *Model) toggleToolResults() {
+	m.toolResultsCollapsed = !m.toolResultsCollapsed
+	for i := range m.chatBlocks {
+		if m.chatBlocks[i].kind == bToolResult {
+			m.chatBlocks[i].collapsed = m.toolResultsCollapsed
+			m.updateBlock(i)
+		}
+	}
+}
+
 
 func summarize(input string) string {
 	trimmed := strings.TrimSpace(input)
@@ -1193,31 +1817,7 @@ func lastAssistantContent(messages []openrouter.Message) string {
 	return ""
 }
 
-func (m Model) renderHistoryLines(messages []openrouter.Message) []string {
-	out := make([]string, 0, len(messages))
-	for _, msg := range messages {
-		switch msg.Role {
-		case "user":
-			if strings.TrimSpace(msg.Content) != "" {
-				out = append(out, userLine(msg.Content))
-			}
-		case "assistant":
-			if strings.TrimSpace(msg.Content) != "" {
-				out = append(out, renderAssistantMarkdown(m.mdRenderer, msg.Content, m.width))
-			}
-			for _, tc := range msg.ToolCalls {
-				out = append(out, metaStyle.Render(fmt.Sprintf("↳ tool call: %s(%s)", tc.Function.Name, tc.Function.Arguments)))
-			}
-		case "tool":
-			name := msg.Name
-			if strings.TrimSpace(name) == "" {
-				name = "tool"
-			}
-			out = append(out, metaStyle.Render(fmt.Sprintf("↳ tool result (%s): %s", name, summarize(msg.Content))))
-		}
-	}
-	return out
-}
+
 
 func renderTree(nodes []session.Node, currentNodeID string) []string {
 	children := make(map[string][]session.Node)
@@ -1294,6 +1894,242 @@ func renderLinearTree(children map[string][]session.Node, roots []session.Node, 
 	return out, true
 }
 
+// ── permission dialog ─────────────────────────────────────────────────────────
+
+// updatePermission handles keyboard input while a permission dialog is shown.
+func (m Model) updatePermission(msg tea.Msg) (tea.Model, tea.Cmd) {
+	key, ok := msg.(tea.KeyMsg)
+	if !ok {
+		// Pass stream messages through so the spinner keeps ticking.
+		if _, spin := msg.(spinner.TickMsg); spin && m.running {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+	}
+
+	if m.currentPerm == nil || m.permService == nil {
+		m.mode = chatMode
+		m.input.Focus()
+		return m, textinput.Blink
+	}
+
+	id := m.currentPerm.ID
+
+	switch key.String() {
+	case "y", "Y", "a", "A", "enter":
+		// Allow once.
+		m.permService.Grant(id)
+		return m.closePermDialog()
+
+	case "s", "S":
+		// Allow for session — cache this specific tool+action+path.
+		m.permService.GrantPersistent(id)
+		return m.closePermDialog()
+
+	case "n", "N", "d", "D", "esc":
+		// Deny.
+		m.permService.Deny(id)
+		m.appendBlock(chatBlock{kind: bError, content: fmt.Sprintf("⛔ Permission denied: %s %s", m.currentPerm.ToolName, m.currentPerm.Action)})
+		return m.closePermDialog()
+	}
+
+	return m, nil
+}
+
+// closePermDialog clears the current permission request and returns to chat mode.
+func (m Model) closePermDialog() (tea.Model, tea.Cmd) {
+	m.currentPerm = nil
+	m.mode = chatMode
+	m.input.Focus()
+	// Resume listening for the next permission request.
+	var permCmd tea.Cmd
+	if m.permService != nil {
+		permCmd = waitForPermission(m.permService.Subscribe())
+	}
+	return m, tea.Batch(textinput.Blink, permCmd)
+}
+
+// renderPermDialog renders the permission request dialog box.
+func (m Model) renderPermDialog() string {
+	if m.currentPerm == nil {
+		return ""
+	}
+	req := m.currentPerm
+	dialogWidth := m.width - 4
+	if dialogWidth < 40 {
+		dialogWidth = 40
+	}
+	innerWidth := dialogWidth - 4 // account for border + padding
+
+	var b strings.Builder
+
+	// Title
+	b.WriteString(permTitleStyle.Render("🔒 Permission Required") + "\n")
+
+	// Tool + Action
+	b.WriteString(
+		permLabelStyle.Render("Tool   ") +
+			permValueStyle.Render(req.ToolName) +
+			permLabelStyle.Render("  ·  action  ") +
+			permValueStyle.Render(req.Action) + "\n",
+	)
+
+	// Path
+	b.WriteString(permLabelStyle.Render("Path   ") + permValueStyle.Render(req.Path) + "\n")
+
+	// Tool-specific content block
+	content := m.renderPermContent(req, innerWidth)
+	if content != "" {
+		b.WriteString("\n" + content + "\n")
+	}
+
+	// Buttons
+	b.WriteString("\n")
+	buttons := permAllowStyle.Render("[y] Allow") +
+		"   " +
+		permSessionStyle.Render("[s] Allow for Session") +
+		"   " +
+		permDenyStyle.Render("[n] Deny")
+	b.WriteString(buttons + "\n")
+	b.WriteString(permHelpStyle.Render("esc = deny"))
+
+	box := permBorderStyle.Width(innerWidth).Render(b.String())
+	return lipgloss.NewStyle().Width(m.width).Render(box)
+}
+
+// renderPermContent renders the tool-specific body of the permission dialog.
+func (m Model) renderPermContent(req *permission.Request, width int) string {
+	switch req.ToolName {
+	case "bash":
+		params, ok := req.Params.(permission.BashParams)
+		if !ok {
+			return ""
+		}
+		cmd := params.Command
+		if len(cmd) > width {
+			cmd = cmd[:width-3] + "..."
+		}
+		return permCodeStyle.Width(width).Render("$ " + cmd)
+
+	case "write":
+		params, ok := req.Params.(permission.WriteParams)
+		if !ok {
+			return ""
+		}
+		preview := params.Content
+		lines := strings.Split(preview, "\n")
+		if len(lines) > 8 {
+			lines = append(lines[:8], fmt.Sprintf("… (%d more lines)", len(lines)-8))
+		}
+		var b strings.Builder
+		for _, l := range lines {
+			if len(l) > width-2 {
+				l = l[:width-5] + "..."
+			}
+			b.WriteString(permDiffAddStyle.Render("+ "+l) + "\n")
+		}
+		return strings.TrimRight(b.String(), "\n")
+
+	case "edit":
+		params, ok := req.Params.(permission.EditParams)
+		if !ok {
+			return ""
+		}
+		var b strings.Builder
+		// Old text (removals)
+		oldLines := strings.Split(strings.TrimRight(params.OldText, "\n"), "\n")
+		if len(oldLines) > 5 {
+			oldLines = append(oldLines[:5], fmt.Sprintf("… (%d more lines)", len(oldLines)-5))
+		}
+		for _, l := range oldLines {
+			if len(l) > width-2 {
+				l = l[:width-5] + "..."
+			}
+			b.WriteString(permDiffDelStyle.Render("- "+l) + "\n")
+		}
+		// New text (additions)
+		newLines := strings.Split(strings.TrimRight(params.NewText, "\n"), "\n")
+		if len(newLines) > 5 {
+			newLines = append(newLines[:5], fmt.Sprintf("… (%d more lines)", len(newLines)-5))
+		}
+		for _, l := range newLines {
+			if len(l) > width-2 {
+				l = l[:width-5] + "..."
+			}
+			b.WriteString(permDiffAddStyle.Render("+ "+l) + "\n")
+		}
+		return strings.TrimRight(b.String(), "\n")
+
+	default:
+		if req.Description != "" {
+			desc := req.Description
+			if len(desc) > width {
+				desc = desc[:width-3] + "..."
+			}
+			return permCodeStyle.Width(width).Render(desc)
+		}
+		return ""
+	}
+}
+
+// runShellCmd runs a shell command (from a ! prefix) and sends shellOutputMsg
+// chunks and a final shellDoneMsg back to the update loop.
+func runShellCmd(command string, ch chan<- tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		cmd := exec.Command("sh", "-c", command)
+		var buf bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &buf
+		err := cmd.Run()
+		output := buf.String()
+		if output != "" {
+			ch <- shellOutputMsg{text: output}
+		}
+		ch <- shellDoneMsg{err: err}
+		return nil
+	}
+}
+
+// waitForPermission returns a Cmd that reads one permission request from ch and
+// wraps it in a permRequestMsg.
+func waitForPermission(ch <-chan permission.Request) tea.Cmd {
+	return func() tea.Msg {
+		req, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return permRequestMsg{req: req}
+	}
+}
+
+// ── shell (!) passthrough ──────────────────────────────────────────────────────
+
+// submitShell runs a raw shell command entered as !<command> in the chat input.
+// The command and its output are displayed together in a bShellBlock.
+func (m Model) submitShell(command string) (tea.Model, tea.Cmd) {
+	if command == "" {
+		return m, nil
+	}
+
+	// Capture the current node ID now; the cmd node will be written in shellDoneMsg
+	// once the full output is available.
+	m.shellCmdParentNodeID = m.currentNodeID
+
+	m.appendBlock(chatBlock{kind: bSep})
+	idx := m.appendBlock(chatBlock{kind: bShellBlock, command: command, streaming: true})
+	m.shellBlockIdx = idx
+	m.running = true
+	m.shellCh = make(chan tea.Msg, 64)
+
+	return m, tea.Batch(
+		runShellCmd(command, m.shellCh),
+		waitForStream(m.shellCh),
+		m.spinner.Tick,
+	)
+}
+
 // ── Lua runtime helpers ───────────────────────────────────────────────────────
 
 func fireEventCmd(rt *luaext.Runtime, event luaext.Event) tea.Cmd {
@@ -1354,4 +2190,76 @@ func sortByRecorded(nodes []session.Node) {
 			}
 		}
 	}
+}
+
+// ── shell path autocompletion ─────────────────────────────────────────────────
+
+// getPathCompletions returns commandDef completions for the given path prefix.
+// It reads the directory that the prefix points into and returns entries whose
+// names begin with the token after the last '/'.
+//
+// Supported prefix forms:
+//
+//	""        → entries in the current working directory
+//	"foo"     → entries in cwd starting with "foo"
+//	"src/"    → all entries inside ./src/
+//	"./sr"    → entries in cwd starting with "sr"
+//	"~/doc"   → entries in $HOME starting with "doc"
+//	"/usr/li" → entries in /usr/ starting with "li"
+func getPathCompletions(prefix string) []commandDef {
+	homeDir, _ := os.UserHomeDir()
+
+	// ── determine lookDir and filePrefix ─────────────────────────────────
+	var lookDir, filePrefix, displayDirPart string
+
+	if strings.HasPrefix(prefix, "~/") {
+		// Home-relative: expand ~ for lookup but keep ~/ in the displayed result.
+		rest := prefix[2:]
+		if idx := strings.LastIndex(rest, "/"); idx >= 0 {
+			lookDir = filepath.Join(homeDir, rest[:idx+1])
+			filePrefix = rest[idx+1:]
+			displayDirPart = "~/" + rest[:idx+1]
+		} else {
+			lookDir = homeDir
+			filePrefix = rest
+			displayDirPart = "~/"
+		}
+	} else if strings.Contains(prefix, "/") {
+		// Absolute or relative path with at least one slash.
+		idx := strings.LastIndex(prefix, "/")
+		lookDir = prefix[:idx+1]
+		if lookDir == "" {
+			lookDir = "/"
+		}
+		filePrefix = prefix[idx+1:]
+		displayDirPart = prefix[:idx+1]
+	} else {
+		// Plain token — complete against current working directory.
+		lookDir = "."
+		filePrefix = prefix
+		displayDirPart = ""
+	}
+
+	entries, err := os.ReadDir(lookDir)
+	if err != nil {
+		return nil
+	}
+
+	var completions []commandDef
+	for _, entry := range entries {
+		name := entry.Name()
+		// Skip hidden files unless the user explicitly started typing a dot.
+		if strings.HasPrefix(name, ".") && !strings.HasPrefix(filePrefix, ".") {
+			continue
+		}
+		if filePrefix != "" && !strings.HasPrefix(strings.ToLower(name), strings.ToLower(filePrefix)) {
+			continue
+		}
+		result := displayDirPart + name
+		if entry.IsDir() {
+			result += "/"
+		}
+		completions = append(completions, commandDef{name: result})
+	}
+	return completions
 }

@@ -370,6 +370,9 @@ func nodeDisplayInfo(msg openrouter.Message) (role, preview string) {
 	case "system":
 		return " sys", nodePreviewText(msg.Content)
 
+	case "cmd":
+		return " cmd", msg.Content
+
 	default:
 		return msg.Role, nodePreviewText(msg.Content)
 	}
@@ -399,6 +402,8 @@ func nodeRoleStyle(role string) string {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Render("tool")
 	case " sys":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(" sys")
+	case " cmd":
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render(" cmd")
 	default:
 		return pickerDimStyle.Render(role)
 	}
