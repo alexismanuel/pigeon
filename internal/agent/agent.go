@@ -23,7 +23,10 @@ type StreamingClient interface {
 
 type toolExecutor interface {
 	Definitions() []openrouter.ToolDefinition
-	Execute(ctx context.Context, name, argumentsJSON string) (string, error)
+	// Execute runs the named tool. result is the plain string returned to the
+	// model; display is an optional ANSI-colourised version for the TUI (empty
+	// means fall back to result).
+	Execute(ctx context.Context, name, argumentsJSON string) (result, display string, err error)
 }
 
 type ToolEvent struct {
@@ -31,7 +34,10 @@ type ToolEvent struct {
 	ToolName  string
 	Arguments string
 	Result    string
-	Err       error
+	// Display is an optional ANSI-colourised version of Result for the TUI.
+	// When empty the TUI should fall back to Result.
+	Display string
+	Err     error
 }
 
 type TurnCallbacks struct {
@@ -118,19 +124,20 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 				Arguments: args,
 			})
 
-			var toolResult string
+			var toolResult, toolDisplay string
 			var toolErr error
 			if cb.BeforeToolCall(name, args) {
 				// Blocked by extension — give the model a clear signal.
 				toolResult = fmt.Sprintf("[tool call '%s' blocked by extension]", name)
 			} else {
-				toolResult, toolErr = a.tools.Execute(ctx, name, args)
+				toolResult, toolDisplay, toolErr = a.tools.Execute(ctx, name, args)
 				if toolErr != nil {
 					if strings.TrimSpace(toolResult) == "" {
 						toolResult = "tool error: " + toolErr.Error()
 					} else {
 						toolResult = toolResult + "\n\nTool error: " + toolErr.Error()
 					}
+					toolDisplay = "" // don't show diff display on error
 				}
 			}
 
@@ -138,6 +145,7 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 				Kind:     "tool_result",
 				ToolName: name,
 				Result:   toolResult,
+				Display:  toolDisplay,
 				Err:      toolErr,
 			})
 

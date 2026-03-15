@@ -49,9 +49,9 @@ type fakeToolExecutor struct {
 
 func (f *fakeToolExecutor) Definitions() []openrouter.ToolDefinition { return f.defs }
 
-func (f *fakeToolExecutor) Execute(_ context.Context, name, argumentsJSON string) (string, error) {
+func (f *fakeToolExecutor) Execute(_ context.Context, name, argumentsJSON string) (string, string, error) {
 	f.calls = append(f.calls, name+":"+argumentsJSON)
-	return f.results[name], f.errs[name]
+	return f.results[name], "", f.errs[name]
 }
 
 func TestAgentRunTurn_SuccessNoTools(t *testing.T) {

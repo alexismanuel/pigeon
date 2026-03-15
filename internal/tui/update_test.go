@@ -442,7 +442,7 @@ func TestSubmitPrompt_NilAgentAddsError(t *testing.T) {
 func pickerModel() Model {
 	m := newTestModel()
 	m.mode = pickerMode
-	m.picker = newPicker(80, 24)
+	m.picker = newPicker(80, 24, nil)
 	return m
 }
 

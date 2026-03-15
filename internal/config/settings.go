@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -18,6 +19,9 @@ type Settings struct {
 	CollapseThinking bool `json:"collapse_thinking"`
 	// Permissions configures the tool-call permission system.
 	Permissions PermissionConfig `json:"permissions"`
+	// FavoriteModels is an ordered list of model IDs pinned at the top of the
+	// model picker.
+	FavoriteModels []string `json:"favorite_models"`
 }
 
 // PermissionConfig controls which tool calls require explicit user approval.
@@ -73,9 +77,10 @@ func defaults() Settings {
 // rawSettings mirrors Settings but uses pointer types for booleans where
 // false is a meaningful override (not just the zero value meaning "unset").
 type rawSettings struct {
-	Keybindings      Keybindings      `json:"keybindings"`
-	CollapseThinking *bool            `json:"collapse_thinking"`
+	Keybindings      Keybindings       `json:"keybindings"`
+	CollapseThinking *bool             `json:"collapse_thinking"`
 	Permissions      *PermissionConfig `json:"permissions"`
+	FavoriteModels   []string          `json:"favorite_models"`
 }
 
 // LoadSettings reads ~/.config/pigeon/settings.json and merges it over the
@@ -126,7 +131,44 @@ func LoadSettings() Settings {
 		s.Permissions = *raw.Permissions
 	}
 
+	// Merge favorites when the JSON key is present (nil slice = not set).
+	if raw.FavoriteModels != nil {
+		s.FavoriteModels = raw.FavoriteModels
+	}
+
 	return s
+}
+
+// SaveFavoriteModels writes the given model IDs to the favorite_models key in
+// ~/.config/pigeon/settings.json, preserving all other existing keys.
+// The directory and file are created if they do not yet exist.
+func SaveFavoriteModels(ids []string) error {
+	path := settingsPath()
+	if path == "" {
+		return fmt.Errorf("could not determine settings path")
+	}
+
+	// Read existing raw JSON so we preserve every other key.
+	raw := make(map[string]json.RawMessage)
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &raw) // ignore parse errors — start fresh
+	}
+
+	favJSON, err := json.Marshal(ids)
+	if err != nil {
+		return fmt.Errorf("marshal favorites: %w", err)
+	}
+	raw["favorite_models"] = favJSON
+
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create settings dir: %w", err)
+	}
+	return os.WriteFile(path, out, 0o644)
 }
 
 // SettingsPath returns the path to the user settings file.

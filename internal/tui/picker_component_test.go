@@ -18,7 +18,7 @@ var pickerModels = []openrouter.ModelInfo{
 }
 
 func loadedPicker() picker {
-	p := newPicker(120, 30)
+	p := newPicker(120, 30, nil)
 	p2, _ := p.Update(modelLoadedMsg{models: pickerModels})
 	return p2
 }
@@ -26,21 +26,21 @@ func loadedPicker() picker {
 // ── newPicker / listHeight ────────────────────────────────────────────────────
 
 func TestNewPicker_StartsLoading(t *testing.T) {
-	p := newPicker(80, 24)
+	p := newPicker(80, 24, nil)
 	if !p.loading {
 		t.Error("picker should start in loading state")
 	}
 }
 
 func TestPickerListHeight_Positive(t *testing.T) {
-	p := newPicker(80, 24)
+	p := newPicker(80, 24, nil)
 	if p.listHeight() <= 0 {
 		t.Errorf("listHeight should be positive, got %d", p.listHeight())
 	}
 }
 
 func TestPickerListHeight_SmallTerminal(t *testing.T) {
-	p := newPicker(80, 4)
+	p := newPicker(80, 4, nil)
 	if p.listHeight() < 3 {
 		t.Errorf("listHeight minimum should be 3, got %d", p.listHeight())
 	}
@@ -49,7 +49,7 @@ func TestPickerListHeight_SmallTerminal(t *testing.T) {
 // ── Update: loading states ────────────────────────────────────────────────────
 
 func TestPickerUpdate_ModelLoaded(t *testing.T) {
-	p := newPicker(120, 30)
+	p := newPicker(120, 30, nil)
 	p2, _ := p.Update(modelLoadedMsg{models: pickerModels})
 	if p2.loading {
 		t.Error("should not be loading after modelLoadedMsg")
@@ -63,7 +63,7 @@ func TestPickerUpdate_ModelLoaded(t *testing.T) {
 }
 
 func TestPickerUpdate_LoadError(t *testing.T) {
-	p := newPicker(80, 24)
+	p := newPicker(80, 24, nil)
 	p2, _ := p.Update(modelLoadErrMsg{err: testErr("connection refused")})
 	if p2.loading {
 		t.Error("should not be loading after error")
@@ -211,7 +211,7 @@ func TestPickerUpdate_NoResultsOnEnter(t *testing.T) {
 // ── Update: window resize ─────────────────────────────────────────────────────
 
 func TestPickerUpdate_WindowResize(t *testing.T) {
-	p := newPicker(80, 24)
+	p := newPicker(80, 24, nil)
 	p2, _ := p.Update(tea.WindowSizeMsg{Width: 160, Height: 50})
 	if p2.width != 160 || p2.height != 50 {
 		t.Errorf("expected 160x50, got %dx%d", p2.width, p2.height)
@@ -221,7 +221,7 @@ func TestPickerUpdate_WindowResize(t *testing.T) {
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func TestPickerView_LoadingState(t *testing.T) {
-	p := newPicker(80, 24)
+	p := newPicker(80, 24, nil)
 	view := p.View()
 	if !strings.Contains(strings.ToLower(view), "loading") {
 		t.Errorf("expected loading message: %q", view)
@@ -229,7 +229,7 @@ func TestPickerView_LoadingState(t *testing.T) {
 }
 
 func TestPickerView_ErrorState(t *testing.T) {
-	p := newPicker(80, 24)
+	p := newPicker(80, 24, nil)
 	p2, _ := p.Update(modelLoadErrMsg{err: testErr("timed out")})
 	view := p2.View()
 	if !strings.Contains(view, "timed out") {
@@ -272,11 +272,190 @@ func TestPickerView_ShowsFooterHint(t *testing.T) {
 }
 
 func TestPickerView_NoModels(t *testing.T) {
-	p := newPicker(80, 24)
+	p := newPicker(80, 24, nil)
 	p2, _ := p.Update(modelLoadedMsg{models: nil})
 	view := p2.View()
 	if !strings.Contains(view, "no models") {
 		t.Errorf("expected 'no models' message: %q", view)
+	}
+}
+
+// ── favorites ─────────────────────────────────────────────────────────────────
+
+// loadedPickerWithFavs returns a loaded picker with the given model IDs
+// pre-marked as favorites.
+func loadedPickerWithFavs(favIDs []string) picker {
+	p := newPicker(120, 40, favIDs)
+	p, _ = p.Update(modelLoadedMsg{models: pickerModels})
+	return p
+}
+
+func TestPickerFav_PressFAddsToFavorites(t *testing.T) {
+	p := loadedPicker() // cursor at 0 = Claude 3.5 Sonnet
+	p2, cmd := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	if cmd == nil {
+		t.Fatal("expected cmd after f")
+	}
+	msg, ok := cmd().(favoritesChangedMsg)
+	if !ok {
+		t.Fatalf("expected favoritesChangedMsg, got %T", cmd())
+	}
+	if len(msg.ids) != 1 || msg.ids[0] != "anthropic/claude-3-5-sonnet" {
+		t.Errorf("unexpected favorites: %v", msg.ids)
+	}
+	if len(p2.favModels) != 1 {
+		t.Errorf("expected 1 favModel, got %d", len(p2.favModels))
+	}
+}
+
+func TestPickerFav_PressFAgainRemovesFavorite(t *testing.T) {
+	p := loadedPickerWithFavs([]string{"anthropic/claude-3-5-sonnet"})
+	// cursor is 0 = in favorites section = Claude 3.5 Sonnet
+	if p.cursor != 0 || len(p.favModels) != 1 {
+		t.Fatalf("precondition failed: cursor=%d favModels=%d", p.cursor, len(p.favModels))
+	}
+	p2, cmd := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	if cmd == nil {
+		t.Fatal("expected cmd")
+	}
+	msg, ok := cmd().(favoritesChangedMsg)
+	if !ok {
+		t.Fatalf("expected favoritesChangedMsg, got %T", cmd())
+	}
+	if len(msg.ids) != 0 {
+		t.Errorf("expected empty favorites after removal, got %v", msg.ids)
+	}
+	if len(p2.favModels) != 0 {
+		t.Errorf("expected 0 favModels, got %d", len(p2.favModels))
+	}
+}
+
+func TestPickerFav_FavSectionAppearsInView(t *testing.T) {
+	p := loadedPickerWithFavs([]string{"openai/gpt-4o"})
+	view := p.View()
+	if !strings.Contains(view, "★") {
+		t.Errorf("expected ★ in view when favorites exist: %q", view)
+	}
+	if !strings.Contains(view, "Favorites") {
+		t.Errorf("expected 'Favorites' header in view: %q", view)
+	}
+	if !strings.Contains(view, "GPT-4o") {
+		t.Errorf("expected favorite model name in view: %q", view)
+	}
+}
+
+func TestPickerFav_NoFavSectionWhenEmpty(t *testing.T) {
+	p := loadedPicker()
+	view := p.View()
+	if strings.Contains(view, "Favorites") {
+		t.Errorf("'Favorites' section should not appear when there are no favorites: %q", view)
+	}
+}
+
+func TestPickerFav_NavigationSkipsIntoFavSection(t *testing.T) {
+	// With one favorite, cursor=0 is in favorites. Down goes to main list.
+	p := loadedPickerWithFavs([]string{"openai/gpt-4o"})
+	if p.cursor != 0 {
+		t.Fatalf("expected cursor=0, got %d", p.cursor)
+	}
+	// cursor=0 is the favorite; selectedID should be gpt-4o
+	if id := p.selectedID(); id != "openai/gpt-4o" {
+		t.Errorf("expected gpt-4o, got %q", id)
+	}
+	// Move down → enters the main filtered list
+	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if p2.cursor != 1 {
+		t.Errorf("expected cursor=1 after down, got %d", p2.cursor)
+	}
+	// Now in main list: index 0 of filtered = first model overall
+	mainIdx := p2.cursor - len(p2.favModels)
+	if mainIdx < 0 || mainIdx >= len(p2.filtered) {
+		t.Errorf("main index out of range: %d (filtered len=%d)", mainIdx, len(p2.filtered))
+	}
+}
+
+func TestPickerFav_EnterSelectsFavorite(t *testing.T) {
+	p := loadedPickerWithFavs([]string{"openai/gpt-4o"})
+	// cursor=0 = the favorite
+	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("expected cmd")
+	}
+	msg, ok := cmd().(modelPickedMsg)
+	if !ok {
+		t.Fatalf("expected modelPickedMsg, got %T", cmd())
+	}
+	if msg.modelID != "openai/gpt-4o" {
+		t.Errorf("expected gpt-4o, got %q", msg.modelID)
+	}
+}
+
+func TestPickerFav_StarIndicatorInMainList(t *testing.T) {
+	// A favorited model should show ★ in the main list rows too.
+	p := loadedPickerWithFavs([]string{"openai/gpt-4o"})
+	view := p.View()
+	// The star should appear at least twice: once in fav section header, once in main list row.
+	count := strings.Count(view, "★")
+	if count < 2 {
+		t.Errorf("expected ★ to appear at least twice (header + main list), got %d occurrences", count)
+	}
+}
+
+func TestPickerFav_CursorClampedAfterFavRemoval(t *testing.T) {
+	// Start with 2 favorites, cursor at last fav (index 1), remove it.
+	p := loadedPickerWithFavs([]string{"anthropic/claude-3-5-sonnet", "openai/gpt-4o"})
+	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown}) // cursor → 1 (gpt-4o fav)
+	if p.cursor != 1 {
+		t.Fatalf("precondition: cursor=%d", p.cursor)
+	}
+	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}}) // remove gpt-4o
+	// favModels is now 1; cursor must be clamped to valid range
+	total := len(p2.favModels) + len(p2.filtered)
+	if p2.cursor >= total {
+		t.Errorf("cursor %d out of range (total=%d)", p2.cursor, total)
+	}
+}
+
+func TestResolveFavModels_OrderPreserved(t *testing.T) {
+	all := []openrouter.ModelInfo{
+		{ID: "a", Name: "A"},
+		{ID: "b", Name: "B"},
+		{ID: "c", Name: "C"},
+	}
+	got := resolveFavModels([]string{"c", "a"}, all)
+	if len(got) != 2 || got[0].ID != "c" || got[1].ID != "a" {
+		t.Errorf("order not preserved: %v", got)
+	}
+}
+
+func TestResolveFavModels_SkipsMissingIDs(t *testing.T) {
+	all := []openrouter.ModelInfo{{ID: "a", Name: "A"}}
+	got := resolveFavModels([]string{"a", "nonexistent"}, all)
+	if len(got) != 1 || got[0].ID != "a" {
+		t.Errorf("expected only 'a', got %v", got)
+	}
+}
+
+func TestIsFav(t *testing.T) {
+	ids := []string{"a", "b", "c"}
+	if !isFav(ids, "b") {
+		t.Error("b should be a fav")
+	}
+	if isFav(ids, "z") {
+		t.Error("z should not be a fav")
+	}
+}
+
+func TestRemoveFav(t *testing.T) {
+	ids := []string{"a", "b", "c"}
+	got := removeFav(ids, "b")
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Errorf("unexpected result: %v", got)
+	}
+	// removing non-existent is a no-op
+	got2 := removeFav(ids, "z")
+	if len(got2) != 3 {
+		t.Errorf("removing non-existent changed length: %v", got2)
 	}
 }
 

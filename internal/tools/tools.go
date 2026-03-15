@@ -116,19 +116,24 @@ func (e *Executor) Definitions() []openrouter.ToolDefinition {
 	}
 }
 
-func (e *Executor) Execute(ctx context.Context, name, argumentsJSON string) (string, error) {
+// Execute runs the named tool and returns (result, display, error).
+// result is the plain-text string sent back to the model.
+// display is an optional ANSI-colourised string shown in the TUI; when empty
+// the TUI falls back to result.
+func (e *Executor) Execute(ctx context.Context, name, argumentsJSON string) (result, display string, err error) {
 	switch strings.TrimSpace(name) {
 	case "read":
-		return e.execRead(argumentsJSON)
+		result, err = e.execRead(argumentsJSON)
 	case "write":
-		return e.execWrite(ctx, argumentsJSON)
+		result, err = e.execWrite(ctx, argumentsJSON)
 	case "edit":
-		return e.execEdit(ctx, argumentsJSON)
+		result, display, err = e.execEdit(ctx, argumentsJSON)
 	case "bash":
-		return e.execBash(ctx, argumentsJSON)
+		result, err = e.execBash(ctx, argumentsJSON)
 	default:
-		return "", fmt.Errorf("unknown tool: %s", name)
+		err = fmt.Errorf("unknown tool: %s", name)
 	}
+	return
 }
 
 type readArgs struct {
@@ -137,7 +142,7 @@ type readArgs struct {
 	Limit  int    `json:"limit"`
 }
 
-func (e *Executor) execRead(argumentsJSON string) (string, error) {
+func (e *Executor) execRead(argumentsJSON string) (string, error) { //nolint:unparam
 	var args readArgs
 	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
 		return "", fmt.Errorf("invalid arguments: %w", err)
@@ -225,19 +230,19 @@ type editArgs struct {
 	NewText string `json:"newText"`
 }
 
-func (e *Executor) execEdit(ctx context.Context, argumentsJSON string) (string, error) {
+func (e *Executor) execEdit(ctx context.Context, argumentsJSON string) (result, display string, err error) {
 	var args editArgs
-	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
-		return "", fmt.Errorf("invalid arguments: %w", err)
+	if err = json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
+		return "", "", fmt.Errorf("invalid arguments: %w", err)
 	}
 	if strings.TrimSpace(args.Path) == "" {
-		return "", errors.New("path is required")
+		return "", "", errors.New("path is required")
 	}
 	path := e.resolvePath(args.Path)
 
 	if e.permissions != nil {
 		sessionID := permission.SessionIDFromContext(ctx)
-		granted, err := e.permissions.Request(ctx, permission.CreatePermissionRequest{
+		granted, permErr := e.permissions.Request(ctx, permission.CreatePermissionRequest{
 			SessionID:   sessionID,
 			ToolName:    "edit",
 			Action:      "modify",
@@ -245,31 +250,34 @@ func (e *Executor) execEdit(ctx context.Context, argumentsJSON string) (string, 
 			Path:        path,
 			Params:      permission.EditParams{Path: path, OldText: args.OldText, NewText: args.NewText},
 		})
-		if err != nil {
-			return "", fmt.Errorf("permission denied: %w", err)
+		if permErr != nil {
+			return "", "", fmt.Errorf("permission denied: %w", permErr)
 		}
 		if !granted {
-			return "", errors.New("permission denied")
+			return "", "", errors.New("permission denied")
 		}
 	}
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", path, err)
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return "", "", fmt.Errorf("read %s: %w", path, readErr)
 	}
 	content := string(data)
 	count := strings.Count(content, args.OldText)
 	if count == 0 {
-		return "", errors.New("oldText not found")
+		return "", "", errors.New("oldText not found")
 	}
 	if count > 1 {
-		return "", errors.New("oldText matched multiple locations; edit is ambiguous")
+		return "", "", errors.New("oldText matched multiple locations; edit is ambiguous")
 	}
 	updated := strings.Replace(content, args.OldText, args.NewText, 1)
-	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
-		return "", fmt.Errorf("write %s: %w", path, err)
+	if writeErr := os.WriteFile(path, []byte(updated), 0o644); writeErr != nil {
+		return "", "", fmt.Errorf("write %s: %w", path, writeErr)
 	}
-	return fmt.Sprintf("Edited %s", path), nil
+
+	// Build a colorised diff for the TUI and a short summary for the model.
+	diff := buildEditDiff(args.Path, content, updated)
+	return diff.summary, diff.display, nil
 }
 
 type bashArgs struct {

@@ -18,6 +18,7 @@ build:
 install: build
 	mkdir -p $(BINDIR)
 	cp $(BINARY) $(BINDIR)/$(BINARY)
+	codesign --sign - --force $(BINDIR)/$(BINARY)
 	@echo "✓ installed to $(BINDIR)/$(BINARY)"
 
 clean:

@@ -13,12 +13,12 @@ func TestExecutorReadWriteEdit(t *testing.T) {
 	e := &Executor{baseDir: tmp, maxLines: 2000, maxBytes: 50 * 1024}
 
 	writeArgs, _ := json.Marshal(map[string]any{"path": "a/b.txt", "content": "hello\nworld"})
-	if _, err := e.Execute(context.Background(), "write", string(writeArgs)); err != nil {
+	if _, _, err := e.Execute(context.Background(), "write", string(writeArgs)); err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
 
 	readArgs, _ := json.Marshal(map[string]any{"path": "a/b.txt"})
-	out, err := e.Execute(context.Background(), "read", string(readArgs))
+	out, _, err := e.Execute(context.Background(), "read", string(readArgs))
 	if err != nil {
 		t.Fatalf("read failed: %v", err)
 	}
@@ -27,11 +27,11 @@ func TestExecutorReadWriteEdit(t *testing.T) {
 	}
 
 	editArgs, _ := json.Marshal(map[string]any{"path": "a/b.txt", "oldText": "world", "newText": "pigeon"})
-	if _, err := e.Execute(context.Background(), "edit", string(editArgs)); err != nil {
+	if _, _, err := e.Execute(context.Background(), "edit", string(editArgs)); err != nil {
 		t.Fatalf("edit failed: %v", err)
 	}
 
-	out, err = e.Execute(context.Background(), "read", string(readArgs))
+	out, _, err = e.Execute(context.Background(), "read", string(readArgs))
 	if err != nil {
 		t.Fatalf("read after edit failed: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestExecutorReadWriteEdit(t *testing.T) {
 
 	absPath := filepath.Join(tmp, "a", "b.txt")
 	absReadArgs, _ := json.Marshal(map[string]any{"path": absPath})
-	out, err = e.Execute(context.Background(), "read", string(absReadArgs))
+	out, _, err = e.Execute(context.Background(), "read", string(absReadArgs))
 	if err != nil {
 		t.Fatalf("read absolute path failed: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestExecutorBashAndTimeout(t *testing.T) {
 	e := &Executor{baseDir: tmp, maxLines: 2000, maxBytes: 50 * 1024}
 
 	okArgs, _ := json.Marshal(map[string]any{"command": "echo hi"})
-	out, err := e.Execute(context.Background(), "bash", string(okArgs))
+	out, _, err := e.Execute(context.Background(), "bash", string(okArgs))
 	if err != nil {
 		t.Fatalf("bash echo failed: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestExecutorBashAndTimeout(t *testing.T) {
 	}
 
 	timeoutArgs, _ := json.Marshal(map[string]any{"command": "sleep 2", "timeout": 1})
-	_, err = e.Execute(context.Background(), "bash", string(timeoutArgs))
+	_, _, err = e.Execute(context.Background(), "bash", string(timeoutArgs))
 	if err == nil || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("expected timeout error, got: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestExecutorRead_Offset(t *testing.T) {
 	e.Execute(context.Background(), "write", string(wArgs))
 
 	rArgs, _ := json.Marshal(map[string]any{"path": "f.txt", "offset": 2, "limit": 2})
-	out, err := e.Execute(context.Background(), "read", string(rArgs))
+	out, _, err := e.Execute(context.Background(), "read", string(rArgs))
 	if err != nil {
 		t.Fatalf("read with offset: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestExecutorWrite_CreatesDirectories(t *testing.T) {
 	e := &Executor{baseDir: tmp, maxLines: 2000, maxBytes: 50 * 1024}
 
 	wArgs, _ := json.Marshal(map[string]any{"path": "deep/nested/file.txt", "content": "hi"})
-	if _, err := e.Execute(context.Background(), "write", string(wArgs)); err != nil {
+	if _, _, err := e.Execute(context.Background(), "write", string(wArgs)); err != nil {
 		t.Fatalf("write nested path: %v", err)
 	}
 }
@@ -135,7 +135,7 @@ func TestExecutorEdit_OldTextNotFound(t *testing.T) {
 	e.Execute(context.Background(), "write", string(wArgs))
 
 	eArgs, _ := json.Marshal(map[string]any{"path": "f.txt", "oldText": "nothere", "newText": "x"})
-	_, err := e.Execute(context.Background(), "edit", string(eArgs))
+	_, _, err := e.Execute(context.Background(), "edit", string(eArgs))
 	if err == nil {
 		t.Error("expected error when oldText not found")
 	}
@@ -146,7 +146,7 @@ func TestExecutorBash_EnvAndWorkDir(t *testing.T) {
 	e := &Executor{baseDir: tmp, maxLines: 2000, maxBytes: 50 * 1024}
 
 	args, _ := json.Marshal(map[string]any{"command": "pwd"})
-	out, err := e.Execute(context.Background(), "bash", string(args))
+	out, _, err := e.Execute(context.Background(), "bash", string(args))
 	if err != nil {
 		t.Fatalf("pwd failed: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestExecutorBash_EnvAndWorkDir(t *testing.T) {
 func TestExecutorUnknownTool(t *testing.T) {
 	tmp := t.TempDir()
 	e := &Executor{baseDir: tmp, maxLines: 2000, maxBytes: 50 * 1024}
-	_, err := e.Execute(context.Background(), "nonexistent", "{}")
+	_, _, err := e.Execute(context.Background(), "nonexistent", "{}")
 	if err == nil {
 		t.Error("expected error for unknown tool")
 	}

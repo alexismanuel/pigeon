@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -123,9 +124,12 @@ type toolCallMsg struct {
 }
 
 type toolResultMsg struct {
-	name   string
-	result string
-	err    error
+	name    string
+	result  string
+	// display is an optional ANSI-colourised version for the TUI (e.g. a diff).
+	// When empty the TUI falls back to result.
+	display string
+	err     error
 }
 
 type turnDoneMsg struct {
@@ -179,6 +183,7 @@ type Model struct {
 
 	thinkingCollapsed    bool // global collapse state for thinking blocks
 	toolResultsCollapsed bool // global collapse state for tool results
+	favoriteModels       []string // ordered list of favorite model IDs (persisted)
 	spinner          spinner.Model
 
 	registry     *resources.Registry
@@ -317,6 +322,7 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 		streamingThinkingIdx:  -1,
 		shellBlockIdx:         -1,
 		thinkingCollapsed:     settings.CollapseThinking,
+		favoriteModels:        append([]string(nil), settings.FavoriteModels...),
 		spinner:               sp,
 		mdRenderer:            mdRenderer,
 		mdStyle:               mdStyle,
@@ -414,7 +420,7 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if ws, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width = ws.Width
 		m.height = ws.Height
-		m.input.Width = max(20, ws.Width-4)
+		m.input.Width = max(20, ws.Width-8)
 		// Rebuild glamour renderer with the new word-wrap width.
 		// Use WithStandardStyle (not WithAutoStyle) to avoid an OSC 11 query.
 		// Content area = termWidth - msgBlockPrefix (border+padding).
@@ -484,6 +490,12 @@ func (m Model) updatePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.mode = chatMode
 		m.input.Focus()
 		return m, textinput.Blink
+	case favoritesChangedMsg:
+		m.favoriteModels = msg.ids
+		if err := config.SaveFavoriteModels(msg.ids); err != nil {
+			m.appendBlock(chatBlock{kind: bError, content: "failed to save favorites: " + err.Error()})
+		}
+		return m, nil
 	default:
 		var cmd tea.Cmd
 		m.picker, cmd = m.picker.Update(msg)
@@ -693,6 +705,11 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			content = msg.err.Error()
 		}
+		// display overrides what's shown in the TUI (e.g. a colourised diff).
+		display := content
+		if msg.display != "" {
+			display = msg.display
+		}
 		// Update the matching bToolCall header so the icon flips to ✓/✗.
 		for i := len(m.chatBlocks) - 1; i >= 0; i-- {
 			if m.chatBlocks[i].kind == bToolCall && m.chatBlocks[i].toolName == msg.name {
@@ -705,7 +722,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendBlock(chatBlock{
 			kind:      bToolResult,
 			toolName:  msg.name,
-			content:   content,
+			content:   display,
 			isErr:     msg.err != nil,
 			collapsed: m.toolResultsCollapsed,
 		})
@@ -978,9 +995,16 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 		if m.sessionID != "" {
 			ctx = permission.ContextWithSessionID(ctx, m.sessionID)
 		}
+		// xmlRouter detects <thinking>…</thinking> blocks embedded in the
+		// regular content stream (used by models such as DeepSeek-R1 and QwQ)
+		// and routes those tokens to the thinking block instead.
+		xmlRouter := newXMLThinkingRouter(
+			func(token string) { ch <- tokenMsg{token: token} },
+			func(token string) { ch <- thinkingTokenMsg{token: token} },
+		)
 		newMessages, err := m.agent.RunTurn(ctx, modelName, hist, input, agent.TurnCallbacks{
 			OnToken: func(token string) {
-				ch <- tokenMsg{token: token}
+				xmlRouter.feed(token)
 			},
 			OnThinkingToken: func(token string) {
 				ch <- thinkingTokenMsg{token: token}
@@ -1009,7 +1033,7 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 							Data: map[string]any{"name": evt.ToolName, "result": evt.Result},
 						})
 					}
-					ch <- toolResultMsg{name: evt.ToolName, result: evt.Result, err: evt.Err}
+					ch <- toolResultMsg{name: evt.ToolName, result: evt.Result, display: evt.Display, err: evt.Err}
 				}
 			},
 		})
@@ -1069,7 +1093,7 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 		if pickerW == 0 {
 			pickerW = 120
 		}
-		m.picker = newPicker(pickerW, pickerH)
+		m.picker = newPicker(pickerW, pickerH, m.favoriteModels)
 		return m, tea.Batch(fetchModels(m.catalog), textinput.Blink)
 
 	case "/new":
@@ -1370,7 +1394,8 @@ func (m Model) viewChat(header string) string {
 	if len(m.suggestions) > 0 {
 		parts = append(parts, m.renderSuggestions())
 	}
-	parts = append(parts, m.input.View())
+	inputView := m.input.View()
+	parts = append(parts, inputView)
 	if statusBar := m.renderStatusBar(); statusBar != "" {
 		parts = append(parts, statusBar)
 	}
@@ -1651,8 +1676,9 @@ func (m Model) renderBlock(b chatBlock) string {
 			icon = toolIconSuccess.Render()
 		}
 		line := icon + " " + toolNameStyle.Render(b.toolName)
-		if b.toolArgs != "" && b.toolArgs != "{}" {
-			line += "  " + toolArgsStyle.Render(b.toolArgs)
+		args := prettyToolArgs(b.toolName, b.toolArgs)
+		if args != "" {
+			line += "  " + toolArgsStyle.Render(args)
 		}
 		return line
 
@@ -1664,6 +1690,8 @@ func (m Model) renderBlock(b chatBlock) string {
 		raw := strings.TrimRight(b.content, "\n")
 		lines := strings.Split(raw, "\n")
 
+		// Diff output is already colourised — use a minimal indent so the
+		// leading +/- symbols stay visible. Plain results get the same padding.
 		lineStyle := lipgloss.NewStyle().PaddingLeft(2)
 
 		maxLines := len(lines)
@@ -1823,6 +1851,45 @@ func (m *Model) toggleToolResults() {
 	}
 }
 
+
+// prettyToolArgs returns a compact, human-readable summary of a tool's JSON
+// arguments for display in the bToolCall header. Falls back to the raw JSON
+// for unknown tools.
+func prettyToolArgs(toolName, argsJSON string) string {
+	if argsJSON == "" || argsJSON == "{}" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &m); err != nil {
+		return argsJSON
+	}
+	switch toolName {
+	case "edit":
+		if path, ok := m["path"].(string); ok {
+			return path
+		}
+	case "write":
+		if path, ok := m["path"].(string); ok {
+			return path
+		}
+	case "read":
+		if path, ok := m["path"].(string); ok {
+			return path
+		}
+	case "bash":
+		if cmd, ok := m["command"].(string); ok {
+			// Show only the first line to keep the header compact.
+			if idx := strings.IndexByte(cmd, '\n'); idx > 0 {
+				cmd = cmd[:idx] + " …"
+			}
+			if len(cmd) > 80 {
+				return cmd[:77] + "…"
+			}
+			return cmd
+		}
+	}
+	return argsJSON
+}
 
 func summarize(input string) string {
 	trimmed := strings.TrimSpace(input)
