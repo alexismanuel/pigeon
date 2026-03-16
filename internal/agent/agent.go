@@ -48,6 +48,9 @@ type TurnCallbacks struct {
 	// Returning true blocks the call; the agent substitutes a canned
 	// "blocked by extension" result so the model can continue cleanly.
 	BeforeToolCall func(name, args string) bool
+	// OnUsage is called after each provider API call with the token counts
+	// for that individual call. The TUI accumulates these into session totals.
+	OnUsage func(openrouter.Usage)
 }
 
 type Agent struct {
@@ -88,6 +91,9 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 	if cb.BeforeToolCall == nil {
 		cb.BeforeToolCall = func(string, string) bool { return false }
 	}
+	if cb.OnUsage == nil {
+		cb.OnUsage = func(openrouter.Usage) {}
+	}
 
 	messages := append([]openrouter.Message{}, history...)
 	messages = append(messages, openrouter.Message{Role: "user", Content: userInput})
@@ -106,6 +112,7 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 		if err != nil {
 			return nil, err
 		}
+		cb.OnUsage(assistantMsg.Usage)
 
 		messages = append(messages, assistantMsg)
 		newMessages = append(newMessages, assistantMsg)

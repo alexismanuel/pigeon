@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,12 @@ import (
 
 	"pigeon/internal/permission"
 	"pigeon/internal/provider/openrouter"
+)
+
+const (
+	readMaxFileSize  = 5 * 1024 * 1024 // 5 MB — refuse to load larger files
+	readDefaultLimit = 2000             // lines returned when no limit is given
+	readMaxLineLen   = 2000             // chars per line; longer lines are trimmed
 )
 
 const (
@@ -54,14 +61,17 @@ func (e *Executor) Definitions() []openrouter.ToolDefinition {
 		{
 			Type: "function",
 			Function: openrouter.ToolFunctionDefinition{
-				Name:        "read",
-				Description: "Read a text file. Supports optional offset/limit line slicing.",
+				Name: "read",
+				Description: "Read a text file with line numbers. " +
+					"Returns up to 2000 lines by default. " +
+					"Use offset (1-based) and limit to paginate large files. " +
+					"Each output line is prefixed with its line number so you can reference exact lines in follow-up edits.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"path": map[string]any{"type": "string"},
-						"offset": map[string]any{"type": "integer", "minimum": 1},
-						"limit": map[string]any{"type": "integer", "minimum": 1},
+						"path":   map[string]any{"type": "string"},
+						"offset": map[string]any{"type": "integer", "minimum": 1, "description": "1-based line number to start reading from"},
+						"limit":  map[string]any{"type": "integer", "minimum": 1, "description": "maximum number of lines to return (default 2000)"},
 					},
 					"required": []string{"path"},
 				},
@@ -123,7 +133,7 @@ func (e *Executor) Definitions() []openrouter.ToolDefinition {
 func (e *Executor) Execute(ctx context.Context, name, argumentsJSON string) (result, display string, err error) {
 	switch strings.TrimSpace(name) {
 	case "read":
-		result, err = e.execRead(argumentsJSON)
+		result, display, err = e.execRead(argumentsJSON)
 	case "write":
 		result, err = e.execWrite(ctx, argumentsJSON)
 	case "edit":
@@ -138,48 +148,165 @@ func (e *Executor) Execute(ctx context.Context, name, argumentsJSON string) (res
 
 type readArgs struct {
 	Path   string `json:"path"`
-	Offset int    `json:"offset"`
-	Limit  int    `json:"limit"`
+	Offset int    `json:"offset"` // 1-based; 0 means start from line 1
+	Limit  int    `json:"limit"`  // 0 means use readDefaultLimit
 }
 
-func (e *Executor) execRead(argumentsJSON string) (string, error) { //nolint:unparam
+func (e *Executor) execRead(argumentsJSON string) (result, display string, err error) {
 	var args readArgs
-	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
-		return "", fmt.Errorf("invalid arguments: %w", err)
+	if err = json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
+		return "", "", fmt.Errorf("invalid arguments: %w", err)
 	}
 	if strings.TrimSpace(args.Path) == "" {
-		return "", errors.New("path is required")
+		return "", "", errors.New("path is required")
 	}
 	path := e.resolvePath(args.Path)
 
-	data, err := os.ReadFile(path)
+	// ── stat: existence, type, size ──────────────────────────────────────────
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			msg := fmt.Sprintf("file not found: %s", path)
+			if suggestions := readSuggestSimilar(path); len(suggestions) > 0 {
+				msg += "\n\nDid you mean one of these?\n" + strings.Join(suggestions, "\n")
+			}
+			return "", "", errors.New(msg)
+		}
+		return "", "", fmt.Errorf("stat %s: %w", path, statErr)
+	}
+	if info.IsDir() {
+		return "", "", fmt.Errorf("%s is a directory, not a file", path)
+	}
+	if info.Size() > readMaxFileSize {
+		return "", "", fmt.Errorf("file is too large (%d bytes); maximum is %d bytes", info.Size(), readMaxFileSize)
+	}
+
+	// ── offset / limit ───────────────────────────────────────────────────────
+	// offset is 1-based in the public API (0 and 1 both mean "start at line 1").
+	offset := 0
+	if args.Offset > 1 {
+		offset = args.Offset - 1 // convert to 0-based skip count
+	}
+	limit := readDefaultLimit
+	if args.Limit > 0 {
+		limit = args.Limit
+	}
+
+	// ── buffered read ─────────────────────────────────────────────────────────
+	lines, hasMore, readErr := readFileLines(path, offset, limit)
+	if readErr != nil {
+		return "", "", fmt.Errorf("read %s: %w", path, readErr)
+	}
+
+	// ── UTF-8 check ───────────────────────────────────────────────────────────
+	for _, l := range lines {
+		if !utf8.ValidString(l) {
+			return "", "", fmt.Errorf("file contains non-UTF-8 text: %s", path)
+		}
+	}
+
+	// ── AI result: line-numbered text ─────────────────────────────────────────
+	startLine := offset + 1 // 1-based line number of the first returned line
+	result = addReadLineNumbers(lines, startLine)
+	if hasMore {
+		lastLine := startLine + len(lines) - 1
+		result += fmt.Sprintf("\n\n[truncated — file continues beyond line %d; use offset=%d to read more]",
+			lastLine, lastLine+1)
+	}
+
+	// ── TUI display: syntax-highlighted with gutter ───────────────────────────
+	display = renderReadDisplay(args.Path, lines, startLine)
+
+	return result, display, nil
+}
+
+// readFileLines reads [offset, offset+limit) lines from path using a buffered
+// scanner so large files are never fully loaded into memory.
+// offset is 0-based. hasMore is true when the file contains more lines beyond
+// the returned slice.
+func readFileLines(path string, offset, limit int) (lines []string, hasMore bool, err error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", path, err)
+		return nil, false, err
 	}
-	text := string(data)
-	if !utf8.Valid(data) {
-		return "", fmt.Errorf("file is not valid utf-8 text: %s", path)
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	// 1 MB scanner buffer handles very long lines (minified JS, base64, etc.).
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	// Skip offset lines.
+	for i := 0; i < offset && scanner.Scan(); i++ {}
+	if err = scanner.Err(); err != nil {
+		return nil, false, err
 	}
 
-	lines := strings.Split(text, "\n")
-	start := 0
-	if args.Offset > 0 {
-		start = args.Offset - 1
+	// Collect up to limit lines, capping each line's length.
+	lines = make([]string, 0, limit)
+	for len(lines) < limit && scanner.Scan() {
+		line := scanner.Text()
+		if len(line) > readMaxLineLen {
+			line = line[:readMaxLineLen] + "…"
+		}
+		lines = append(lines, line)
 	}
-	if start > len(lines) {
-		start = len(lines)
-	}
-	end := len(lines)
-	if args.Limit > 0 && start+args.Limit < end {
-		end = start + args.Limit
-	}
-	selected := strings.Join(lines[start:end], "\n")
 
-	truncated, wasTruncated := truncateOutput(selected, e.maxLines, e.maxBytes)
-	if wasTruncated {
-		return truncated + "\n\n[output truncated]", nil
+	// Peek at one more line to know if the file continues.
+	hasMore = len(lines) == limit && scanner.Scan()
+
+	if err = scanner.Err(); err != nil {
+		return nil, false, err
 	}
-	return truncated, nil
+	return lines, hasMore, nil
+}
+
+// addReadLineNumbers prefixes each line with a right-aligned line number and a
+// │ separator, matching crush's style. startLine is 1-based.
+func addReadLineNumbers(lines []string, startLine int) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	// Width needed for the largest line number.
+	width := len(fmt.Sprintf("%d", startLine+len(lines)-1))
+	if width < 4 {
+		width = 4
+	}
+	var b strings.Builder
+	for i, l := range lines {
+		fmt.Fprintf(&b, "%*d│%s\n", width, startLine+i, l)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// readSuggestSimilar looks for files in the same directory whose stem (name
+// without extension) contains or is contained by the target stem. Returns up
+// to 3 matches as full paths.
+func readSuggestSimilar(path string) []string {
+	dir := filepath.Dir(path)
+	full := strings.ToLower(filepath.Base(path))
+	ext := strings.ToLower(filepath.Ext(full))
+	stem := strings.TrimSuffix(full, ext) // e.g. "foo" from "foo.go"
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		ename := strings.ToLower(e.Name())
+		eext := strings.ToLower(filepath.Ext(ename))
+		estem := strings.TrimSuffix(ename, eext)
+		// Match on full name or just stem.
+		if strings.Contains(ename, full) || strings.Contains(full, ename) ||
+			(stem != "" && (strings.Contains(estem, stem) || strings.Contains(stem, estem))) {
+			out = append(out, filepath.Join(dir, e.Name()))
+			if len(out) >= 3 {
+				break
+			}
+		}
+	}
+	return out
 }
 
 type writeArgs struct {

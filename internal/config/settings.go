@@ -17,6 +17,9 @@ type Settings struct {
 	// CollapseThinking controls whether thinking blocks are collapsed after a
 	// turn completes.  Defaults to false (thinking shown in full).
 	CollapseThinking bool `json:"collapse_thinking"`
+	// CollapseToolResults controls whether tool-result blocks are collapsed by
+	// default.  Defaults to true (results shown in preview only).
+	CollapseToolResults bool `json:"collapse_tool_results"`
 	// Permissions configures the tool-call permission system.
 	Permissions PermissionConfig `json:"permissions"`
 	// FavoriteModels is an ordered list of model IDs pinned at the top of the
@@ -63,7 +66,8 @@ type Keybindings struct {
 // or when individual fields are left blank/unset.
 func defaults() Settings {
 	return Settings{
-		CollapseThinking: false,
+		CollapseThinking:    false,
+		CollapseToolResults: true,
 		Keybindings: Keybindings{
 			ClearInput:     "alt+c",
 			Quit:           "alt+q",
@@ -77,10 +81,11 @@ func defaults() Settings {
 // rawSettings mirrors Settings but uses pointer types for booleans where
 // false is a meaningful override (not just the zero value meaning "unset").
 type rawSettings struct {
-	Keybindings      Keybindings       `json:"keybindings"`
-	CollapseThinking *bool             `json:"collapse_thinking"`
-	Permissions      *PermissionConfig `json:"permissions"`
-	FavoriteModels   []string          `json:"favorite_models"`
+	Keybindings         Keybindings       `json:"keybindings"`
+	CollapseThinking    *bool             `json:"collapse_thinking"`
+	CollapseToolResults *bool             `json:"collapse_tool_results"`
+	Permissions         *PermissionConfig `json:"permissions"`
+	FavoriteModels      []string          `json:"favorite_models"`
 }
 
 // LoadSettings reads ~/.config/pigeon/settings.json and merges it over the
@@ -121,9 +126,12 @@ func LoadSettings() Settings {
 		s.Keybindings.ToggleTools = raw.Keybindings.ToggleTools
 	}
 
-	// Merge bool: pointer distinguishes explicit false from "not set".
+	// Merge bools: pointer distinguishes explicit false from "not set".
 	if raw.CollapseThinking != nil {
 		s.CollapseThinking = *raw.CollapseThinking
+	}
+	if raw.CollapseToolResults != nil {
+		s.CollapseToolResults = *raw.CollapseToolResults
 	}
 
 	// Merge permissions block when present.

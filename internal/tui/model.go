@@ -143,6 +143,12 @@ type turnErrMsg struct {
 type statusUpdateMsg luaext.StatusUpdate
 type extCommandDoneMsg struct{ err error }
 
+// usageMsg carries token usage for one provider API call (fired per round).
+type usageMsg struct {
+	inputTokens  int
+	outputTokens int
+}
+
 // ── main model ─────────────────────────────────────────────────────────────────
 
 type Model struct {
@@ -217,8 +223,19 @@ type Model struct {
 	statusCh <-chan luaext.StatusUpdate
 	statuses map[string]string // id → text, from extension set_status calls
 
+	// Token usage tracking — accumulated across all API calls in this session.
+	sessionInputTokens  int
+	sessionOutputTokens int
+	// modelContextLengths maps model ID → context window size (tokens).
+	// Populated when the model catalog is first fetched.
+	modelContextLengths map[string]int
+
 	suggestions []commandDef
 	suggCursor  int
+
+	// Starship-style prompt
+	workingDir string // cached at startup, stable for the process lifetime
+	gitBranch  string // current git branch, refreshed after each turn
 }
 
 var (
@@ -254,6 +271,15 @@ var (
 	bgUser  = lipgloss.Color("#131a2e")
 	bgShell = lipgloss.Color("#141414") // near-black for shell blocks
 
+	// ── Starship-style prompt — catppuccin macchiato palette ─────────────────
+	promptDirStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#b7bdf8")).Bold(true)
+	promptCatGreen    = lipgloss.NewStyle().Foreground(lipgloss.Color("#a6da95"))
+	promptCatRed      = lipgloss.NewStyle().Foreground(lipgloss.Color("#ed8796"))
+	promptArrowPeach  = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5a97f"))
+	promptArrowYellow = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	promptArrowCyan   = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+	promptBranchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#c6a0f6")).Bold(true)
+
 	shellBlockBorderPrefix = lipgloss.NewStyle().
 				BorderStyle(lipgloss.ThickBorder()).
 				BorderLeft(true).
@@ -287,7 +313,7 @@ type permRequestMsg struct {
 func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions sessionStore, sessionID string, reg *resources.Registry, rt *luaext.Runtime, statusCh <-chan luaext.StatusUpdate, settings config.Settings, perm permission.Service, onProviderLogin func(providerID string), systemPrompt ...string) Model {
 	in := textinput.New()
 	in.Placeholder = "Ask pigeon..."
-	in.Prompt = "> "
+	in.Prompt = "> " // replaced by syncPrompt() below
 	in.Focus()
 	in.CharLimit = 0
 	in.Width = 100
@@ -322,6 +348,7 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 		streamingThinkingIdx:  -1,
 		shellBlockIdx:         -1,
 		thinkingCollapsed:     settings.CollapseThinking,
+		toolResultsCollapsed:  settings.CollapseToolResults,
 		favoriteModels:        append([]string(nil), settings.FavoriteModels...),
 		spinner:               sp,
 		mdRenderer:            mdRenderer,
@@ -334,10 +361,16 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 		resourceCmds:          buildResourceCmds(reg, rt),
 		permService:           perm,
 		onProviderLogin:       onProviderLogin,
+		modelContextLengths:   make(map[string]int),
+		workingDir:            currentWorkingDir(),
+		gitBranch:             getGitBranch(),
 	}
 	if len(systemPrompt) > 0 {
 		m.systemPrompt = strings.TrimSpace(systemPrompt[0])
 	}
+
+	// Build the starship-style prompt now that all fields are populated.
+	m = m.syncPrompt()
 
 	// Populate intro blocks (shown before any session content).
 	m.appendIntroBlocks(strings.TrimSpace(sessionID), "")
@@ -372,6 +405,15 @@ func (m Model) Init() tea.Cmd {
 	if m.permService != nil {
 		cmds = append(cmds, waitForPermission(m.permService.Subscribe()))
 	}
+	// Eagerly load the model catalog so context lengths are available for the
+	// token stats display even before the user opens the model picker.
+	if m.catalog != nil {
+		cmds = append(cmds, fetchModels(m.catalog))
+	}
+	// Fetch context lengths from models.dev in the background. This covers
+	// providers (like Anthropic direct) whose catalog returns no context length,
+	// and keeps values current without requiring code changes.
+	cmds = append(cmds, fetchModelsDevContextLengths())
 	return tea.Batch(cmds...)
 }
 
@@ -400,7 +442,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	next, cmd := m.doUpdate(msg)
 	nm := next.(Model)
-	nm.vp.SetContent(strings.Join(nm.lines, "\n"))
+	nm.vp.SetContent(strings.Join(nm.lines, "\n") + "\n\n\n")
 	nm = nm.recalcViewport()
 	return nm, cmd
 }
@@ -416,11 +458,33 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForStatus(m.statusCh)
 	}
 
+	// Capture context lengths whenever the model catalog is loaded (happens
+	// at init time and whenever the picker is opened).
+	if loaded, ok := msg.(modelLoadedMsg); ok {
+		for _, mi := range loaded.models {
+			if mi.ContextLength > 0 {
+				m.modelContextLengths[mi.ID] = mi.ContextLength
+			}
+		}
+		// Fall through so the picker (if open) can also handle the message.
+	}
+
+	// Merge context lengths from models.dev. Only fills gaps — provider catalog
+	// values (e.g. from OpenRouter) take precedence if already populated.
+	if mdev, ok := msg.(modelsDevMsg); ok {
+		for id, ctx := range mdev.contextLengths {
+			if m.modelContextLengths[id] == 0 {
+				m.modelContextLengths[id] = ctx
+			}
+		}
+		return m, nil
+	}
+
 	// Always handle window resizes regardless of mode.
 	if ws, ok := msg.(tea.WindowSizeMsg); ok {
 		m.width = ws.Width
 		m.height = ws.Height
-		m.input.Width = max(20, ws.Width-8)
+		m = m.syncPrompt()
 		// Rebuild glamour renderer with the new word-wrap width.
 		// Use WithStandardStyle (not WithAutoStyle) to avoid an OSC 11 query.
 		// Content area = termWidth - msgBlockPrefix (border+padding).
@@ -484,6 +548,9 @@ func (m Model) updatePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.appendBlock(chatBlock{kind: bError, content: "failed to persist model: " + err.Error()})
 			}
 		}
+		// Reset session token counters when the model changes.
+		m.sessionInputTokens = 0
+		m.sessionOutputTokens = 0
 		m.appendBlock(chatBlock{kind: bMeta, content: "Model set to " + m.modelName})
 		return m, textinput.Blink
 	case modelPickCanceledMsg:
@@ -692,6 +759,11 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateBlock(m.streamingAssistantIdx)
 		return m, waitForStream(m.streamCh)
 
+	case usageMsg:
+		m.sessionInputTokens += msg.inputTokens
+		m.sessionOutputTokens += msg.outputTokens
+		return m, waitForStream(m.streamCh)
+
 	case toolCallMsg:
 		m.collapseThinkingBlock()
 		m.streamingAssistantIdx = -1
@@ -730,6 +802,8 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case turnDoneMsg:
 		m.running = false
+		m.gitBranch = getGitBranch() // refresh in case a tool changed branches
+		m = m.syncPrompt()           // cat icon → green again
 		if m.cancelTurn != nil {
 			m.cancelTurn()
 			m.cancelTurn = nil
@@ -763,6 +837,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case turnErrMsg:
 		m.running = false
+		m = m.syncPrompt() // cat icon → green again
 		m.collapseThinkingBlock()
 		m.streamingAssistantIdx = -1
 		if m.cancelTurn != nil {
@@ -791,6 +866,7 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case shellDoneMsg:
 		m.running = false
+		m = m.syncPrompt() // cat icon → green again
 		if m.shellBlockIdx >= 0 {
 			block := m.chatBlocks[m.shellBlockIdx]
 			m.chatBlocks[m.shellBlockIdx].streaming = false
@@ -834,22 +910,21 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) updateSuggestions() Model {
 	val := m.input.Value()
 
-	// Colour the prompt and text based on the leading character so the user
+	// Colour the input text based on the leading character so the user
 	// always knows which mode they're in:
 	//   !  yellow — shell passthrough
 	//   /  cyan   — slash command
 	//   default   — normal (no override)
+	// The prompt arrow colour is handled inside syncPrompt / buildPromptStr.
 	switch {
 	case strings.HasPrefix(val, "!"):
-		m.input.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 		m.input.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	case strings.HasPrefix(val, "/"):
-		m.input.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
 		m.input.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	default:
-		m.input.PromptStyle = lipgloss.NewStyle()
 		m.input.TextStyle = lipgloss.NewStyle()
 	}
+	m = m.syncPrompt()
 
 	// Show suggestions only when typing a command name (starts with / but no space yet).
 	if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
@@ -972,6 +1047,7 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 	m.streamingAssistantIdx = -1
 	m.streamingThinkingIdx = -1
 	m.running = true
+	m = m.syncPrompt() // cat icon → red while running
 	m.streamCh = make(chan tea.Msg, 128)
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelTurn = cancel
@@ -1008,6 +1084,9 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 			},
 			OnThinkingToken: func(token string) {
 				ch <- thinkingTokenMsg{token: token}
+			},
+			OnUsage: func(u openrouter.Usage) {
+				ch <- usageMsg{inputTokens: u.InputTokens, outputTokens: u.OutputTokens}
 			},
 			// BeforeToolCall fires EventToolCall synchronously in the agent goroutine
 			// so Lua handlers can block execution before it happens.
@@ -1070,6 +1149,9 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			// Direct set by id — skip picker.
 			id := parts[1]
 			m.modelName = id
+			// Reset session token counters when the model changes.
+			m.sessionInputTokens = 0
+			m.sessionOutputTokens = 0
 			if m.sessions != nil && m.sessionID != "" {
 				if err := m.sessions.SetSessionModel(m.sessionID, m.modelName); err != nil {
 					m.appendBlock(chatBlock{kind: bError, content: "failed to persist model: "+err.Error()})
@@ -1403,20 +1485,49 @@ func (m Model) viewChat(header string) string {
 }
 
 func (m Model) renderStatusBar() string {
-	if len(m.statuses) == 0 {
+	var parts []string
+
+	// Token usage stats — always shown once any tokens have been exchanged.
+	if m.sessionInputTokens > 0 || m.sessionOutputTokens > 0 {
+		ctxLen := m.modelContextLengths[m.modelName]
+		stats := "in " + formatTokenCount(m.sessionInputTokens) +
+			"  out " + formatTokenCount(m.sessionOutputTokens)
+		if ctxLen > 0 {
+			total := m.sessionInputTokens + m.sessionOutputTokens
+			pct := total * 100 / ctxLen
+			stats += "  " + fmt.Sprintf("%d%%", pct) + " of " + formatTokenCount(ctxLen) + " ctx"
+		}
+		parts = append(parts, stats)
+	}
+
+	// Extension-set status items (stable alphabetical order).
+	if len(m.statuses) > 0 {
+		keys := make([]string, 0, len(m.statuses))
+		for k := range m.statuses {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			parts = append(parts, m.statuses[k])
+		}
+	}
+
+	if len(parts) == 0 {
 		return ""
 	}
-	// stable order: sort keys
-	keys := make([]string, 0, len(m.statuses))
-	for k := range m.statuses {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, m.statuses[k])
-	}
 	return metaStyle.Render(strings.Join(parts, "  ·  "))
+}
+
+// formatTokenCount formats a token count compactly: 1234 → "1.2k", 1000000 → "1.0M".
+func formatTokenCount(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 func (m Model) renderSuggestions() string {
@@ -1487,7 +1598,7 @@ func (m Model) recalcViewport() Model {
 			visibleSuggs = 10 + 1 // +1 for the "… N more" line
 		}
 		chrome = headerLines + 3 + visibleSuggs
-		if len(m.statuses) > 0 {
+		if m.renderStatusBar() != "" {
 			chrome++ // status bar
 		}
 	}
@@ -1528,6 +1639,110 @@ func glamourStyle() string {
 		return s
 	}
 	return "dark"
+}
+
+// ── Starship-style prompt helpers ─────────────────────────────────────────────
+
+// currentWorkingDir returns the process working directory, falling back to "".
+func currentWorkingDir() string {
+	cwd, _ := os.Getwd()
+	return cwd
+}
+
+// fishAbbrevPath abbreviates a filesystem path using fish's pwd style:
+// the home directory is replaced by "~", and every path component except the
+// last is truncated to its first character.
+//
+//	/Users/alexis/workspace/pigeon  →  ~/w/pigeon
+func fishAbbrevPath(path string) string {
+	home, err := os.UserHomeDir()
+	if err == nil {
+		if path == home {
+			return "~"
+		}
+		if strings.HasPrefix(path, home+"/") {
+			path = "~" + path[len(home):]
+		}
+	}
+	parts := strings.Split(path, "/")
+	for i := 0; i < len(parts)-1; i++ {
+		p := parts[i]
+		if p == "" || p == "~" {
+			continue // keep empty leading segment and tilde as-is
+		}
+		runes := []rune(p)
+		if len(runes) > 1 {
+			parts[i] = string(runes[:1])
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+// getGitBranch returns the current git branch name, or "" when not in a repo.
+func getGitBranch() string {
+	out, err := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	branch := strings.TrimSpace(string(out))
+	if branch == "HEAD" {
+		return "" // detached HEAD — don't show a branch name
+	}
+	return branch
+}
+
+// buildPromptStr renders the starship-style input prompt using the current
+// model state (working directory, git branch, running flag, input prefix).
+//
+// Colours follow the catppuccin macchiato palette used in starship.toml:
+//
+//	directory   lavender  #b7bdf8
+//	cat icon    green     #a6da95  (red while running)
+//	arrow ❯     peach     #f5a97f  (yellow for !, cyan for /)
+//	git branch  mauve     #c6a0f6
+func (m Model) buildPromptStr() string {
+	dir := fishAbbrevPath(m.workingDir)
+
+	// Cat icon colour: red while the agent is running.
+	catStyle := promptCatGreen
+	if m.running {
+		catStyle = promptCatRed
+	}
+
+	// Arrow colour: reflects the current input mode.
+	arrowStyle := promptArrowPeach
+	val := m.input.Value()
+	switch {
+	case strings.HasPrefix(val, "!"):
+		arrowStyle = promptArrowYellow
+	case strings.HasPrefix(val, "/"):
+		arrowStyle = promptArrowCyan
+	}
+
+	// Assemble prompt segments.
+	prompt := promptDirStyle.Render(dir) +
+		" " + catStyle.Render("󰄛") +
+		" " + arrowStyle.Render("❯")
+
+	if m.gitBranch != "" {
+		prompt += " " + promptBranchStyle.Render(" "+m.gitBranch)
+	}
+
+	prompt += "  " // breathing room before user text
+	return prompt
+}
+
+// syncPrompt rebuilds the textinput prompt string and adjusts the input width
+// so the total line always fits within the terminal width.
+func (m Model) syncPrompt() Model {
+	prompt := m.buildPromptStr()
+	m.input.Prompt = prompt
+	m.input.PromptStyle = lipgloss.NewStyle() // identity — ANSI already embedded
+	if m.width > 0 {
+		pw := lipgloss.Width(prompt)
+		m.input.Width = max(20, m.width-pw)
+	}
+	return m
 }
 
 // ── chatBlock rendering ───────────────────────────────────────────────────────
@@ -1692,7 +1907,7 @@ func (m Model) renderBlock(b chatBlock) string {
 
 		// Diff output is already colourised — use a minimal indent so the
 		// leading +/- symbols stay visible. Plain results get the same padding.
-		lineStyle := lipgloss.NewStyle().PaddingLeft(2)
+		lineStyle := lipgloss.NewStyle().PaddingLeft(4)
 
 		maxLines := len(lines)
 		if b.collapsed {
@@ -1709,10 +1924,10 @@ func (m Model) renderBlock(b chatBlock) string {
 
 		if b.collapsed && len(lines) > toolResultPreviewLines {
 			out = append(out, toolTruncStyle.Render(fmt.Sprintf(
-				"  … %d more lines  [alt+r to expand]", len(lines)-toolResultPreviewLines,
+				"    … %d more lines  [alt+r to expand]", len(lines)-toolResultPreviewLines,
 			)))
 		} else if !b.collapsed && len(lines) > toolResultPreviewLines {
-			out = append(out, toolTruncStyle.Render("  [alt+r to collapse]"))
+			out = append(out, toolTruncStyle.Render("    [alt+r to collapse]"))
 		}
 		return strings.Join(out, "\n")
 	}
@@ -1874,7 +2089,14 @@ func prettyToolArgs(toolName, argsJSON string) string {
 		}
 	case "read":
 		if path, ok := m["path"].(string); ok {
-			return path
+			s := path
+			if offset, ok := m["offset"].(float64); ok && offset > 0 {
+				s += fmt.Sprintf("  offset:%d", int(offset))
+			}
+			if limit, ok := m["limit"].(float64); ok && limit > 0 {
+				s += fmt.Sprintf("  limit:%d", int(limit))
+			}
+			return s
 		}
 	case "bash":
 		if cmd, ok := m["command"].(string); ok {
@@ -2224,6 +2446,7 @@ func (m Model) submitShell(command string) (tea.Model, tea.Cmd) {
 	idx := m.appendBlock(chatBlock{kind: bShellBlock, command: command, streaming: true})
 	m.shellBlockIdx = idx
 	m.running = true
+	m = m.syncPrompt() // cat icon → red while running
 	m.shellCh = make(chan tea.Msg, 64)
 
 	return m, tea.Batch(

@@ -42,11 +42,14 @@ const (
 )
 
 // staticModels is the curated list of Anthropic models exposed in pigeon's
-// model picker. Update as new models ship.
+// model picker. Context lengths are intentionally omitted here — they are
+// populated at runtime from models.dev (see tui/modelsdev.go). Update this
+// list as new models ship.
 var staticModels = []openrouter.ModelInfo{
 	{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6", Provider: "anthropic"},
-	{ID: "claude-opus-4-5", Name: "Claude Opus 4.5", Provider: "anthropic"},
+	{ID: "claude-opus-4-6", Name: "Claude Opus 4.6", Provider: "anthropic"},
 	{ID: "claude-sonnet-4-5", Name: "Claude Sonnet 4.5", Provider: "anthropic"},
+	{ID: "claude-opus-4-5", Name: "Claude Opus 4.5", Provider: "anthropic"},
 	{ID: "claude-haiku-4-5-20251001", Name: "Claude Haiku 4.5", Provider: "anthropic"},
 	{ID: "claude-3-7-sonnet-20250219", Name: "Claude Sonnet 3.7", Provider: "anthropic"},
 	{ID: "claude-3-5-sonnet-20241022", Name: "Claude Sonnet 3.5 v2", Provider: "anthropic"},
@@ -79,7 +82,7 @@ func NewClient(apiKey string, httpClient *http.Client) *Client {
 	}
 }
 
-// ListModels returns a static list of current Anthropic models.
+// ListModels returns the static list of Anthropic models.
 func (c *Client) ListModels(_ context.Context) ([]openrouter.ModelInfo, error) {
 	out := make([]openrouter.ModelInfo, len(staticModels))
 	copy(out, staticModels)
@@ -127,7 +130,6 @@ func (c *Client) StreamChatCompletion(
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
-
 	if c.isOAuth {
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 		httpReq.Header.Set("anthropic-beta", oauthBetaHeader)
@@ -317,6 +319,18 @@ type sseData struct {
 	Type  string `json:"type"`
 	Index int    `json:"index"`
 
+	// message_start — contains the initial message with input token count.
+	Message *struct {
+		Usage *struct {
+			InputTokens int `json:"input_tokens"`
+		} `json:"usage,omitempty"`
+	} `json:"message,omitempty"`
+
+	// message_delta — contains output token count at the end of the stream.
+	Usage *struct {
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage,omitempty"`
+
 	// content_block_start
 	ContentBlock *struct {
 		Type string `json:"type"`
@@ -346,6 +360,7 @@ func parseStream(body io.Reader, onEvent openrouter.StreamHandler) (openrouter.M
 	blocks := make(map[int]*blockAccum)
 	var contentBuilder strings.Builder
 	var toolCalls []openrouter.ToolCall
+	var usage openrouter.Usage
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -363,6 +378,12 @@ func parseStream(body io.Reader, onEvent openrouter.StreamHandler) (openrouter.M
 		}
 
 		switch evt.Type {
+		case "message_start":
+			// Input token count is reported here.
+			if evt.Message != nil && evt.Message.Usage != nil {
+				usage.InputTokens = evt.Message.Usage.InputTokens
+			}
+
 		case "content_block_start":
 			if evt.ContentBlock == nil {
 				continue
@@ -400,6 +421,12 @@ func parseStream(body io.Reader, onEvent openrouter.StreamHandler) (openrouter.M
 				})
 			}
 
+		case "message_delta":
+			// Output token count is reported here.
+			if evt.Usage != nil {
+				usage.OutputTokens = evt.Usage.OutputTokens
+			}
+
 		case "message_stop":
 			onEvent(openrouter.StreamEvent{Done: true})
 		}
@@ -418,6 +445,7 @@ func parseStream(body io.Reader, onEvent openrouter.StreamHandler) (openrouter.M
 		Role:      "assistant",
 		Content:   contentBuilder.String(),
 		ToolCalls: toolCalls,
+		Usage:     usage,
 	}, nil
 }
 

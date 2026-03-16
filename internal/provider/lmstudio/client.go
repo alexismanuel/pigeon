@@ -128,9 +128,10 @@ func (c *Client) StreamChatCompletion(
 	}
 
 	payload := map[string]any{
-		"model":    model,
-		"messages": messages,
-		"stream":   true,
+		"model":          model,
+		"messages":       messages,
+		"stream":         true,
+		"stream_options": map[string]any{"include_usage": true},
 	}
 	if len(tools) > 0 {
 		payload["tools"] = tools
@@ -180,6 +181,7 @@ func parseStream(body io.Reader, onEvent openrouter.StreamHandler) (openrouter.M
 
 	var contentBuilder strings.Builder
 	toolCallsByIndex := map[int]*toolCallBuilder{}
+	var usage openrouter.Usage
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -196,12 +198,18 @@ func parseStream(body io.Reader, onEvent openrouter.StreamHandler) (openrouter.M
 				Role:      "assistant",
 				Content:   contentBuilder.String(),
 				ToolCalls: finalizeToolCalls(toolCallsByIndex),
+				Usage:     usage,
 			}, nil
 		}
 
 		var chunk sseChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+		// Capture usage when present (sent in the final chunk).
+		if chunk.Usage != nil {
+			usage.InputTokens = chunk.Usage.PromptTokens
+			usage.OutputTokens = chunk.Usage.CompletionTokens
 		}
 		for _, choice := range chunk.Choices {
 			if choice.Delta.Content != "" {
@@ -238,6 +246,7 @@ func parseStream(body io.Reader, onEvent openrouter.StreamHandler) (openrouter.M
 		Role:      "assistant",
 		Content:   contentBuilder.String(),
 		ToolCalls: finalizeToolCalls(toolCallsByIndex),
+		Usage:     usage,
 	}, nil
 }
 
@@ -290,6 +299,11 @@ type sseChunk struct {
 			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
+	// Usage is present in the final chunk when stream_options.include_usage is true.
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
 }
 
 func parseHTTPError(resp *http.Response) error {

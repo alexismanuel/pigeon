@@ -22,7 +22,8 @@ func TestExecutorReadWriteEdit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read failed: %v", err)
 	}
-	if out != "hello\nworld" {
+	// Output is now line-numbered: "   1│hello\n   2│world"
+	if !strings.Contains(out, "hello") || !strings.Contains(out, "world") {
 		t.Fatalf("unexpected read output: %q", out)
 	}
 
@@ -35,7 +36,7 @@ func TestExecutorReadWriteEdit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read after edit failed: %v", err)
 	}
-	if out != "hello\npigeon" {
+	if !strings.Contains(out, "pigeon") || strings.Contains(out, "world") {
 		t.Fatalf("unexpected content after edit: %q", out)
 	}
 
@@ -45,7 +46,7 @@ func TestExecutorReadWriteEdit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read absolute path failed: %v", err)
 	}
-	if out != "hello\npigeon" {
+	if !strings.Contains(out, "pigeon") {
 		t.Fatalf("unexpected absolute read content: %q", out)
 	}
 }
@@ -107,13 +108,17 @@ func TestExecutorRead_Offset(t *testing.T) {
 	wArgs, _ := json.Marshal(map[string]any{"path": "f.txt", "content": "a\nb\nc\nd"})
 	e.Execute(context.Background(), "write", string(wArgs))
 
+	// offset=2, limit=2 → should return lines 2 and 3 ("b" and "c"), not "a" or "d".
 	rArgs, _ := json.Marshal(map[string]any{"path": "f.txt", "offset": 2, "limit": 2})
 	out, _, err := e.Execute(context.Background(), "read", string(rArgs))
 	if err != nil {
 		t.Fatalf("read with offset: %v", err)
 	}
-	if !strings.Contains(out, "b") || strings.Contains(out, "a") {
+	if !strings.Contains(out, "b") || !strings.Contains(out, "c") {
 		t.Errorf("offset/limit not applied: %q", out)
+	}
+	if strings.Contains(out, "│a") || strings.Contains(out, "│d") {
+		t.Errorf("offset/limit returned out-of-range lines: %q", out)
 	}
 }
 
