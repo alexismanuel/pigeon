@@ -140,6 +140,20 @@ arrays. Mixed or string-keyed tables become JSON objects.
 
 ---
 
+### `pigeon.session_model() → string | nil`
+
+Returns the model ID of the current session (e.g. `"openai/gpt-4o"`), or `nil`
+if no model is set.
+
+```lua
+local model = pigeon.session_model()
+if model and model:find("/") then
+  -- likely an OpenRouter model
+end
+```
+
+---
+
 ## Extension lifecycle
 
 ```

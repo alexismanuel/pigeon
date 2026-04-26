@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"pigeon/internal/provider/openrouter"
 )
@@ -71,7 +71,7 @@ func TestSessionPickerUpdate_LoadError(t *testing.T) {
 
 func TestSessionPickerUpdate_Down(t *testing.T) {
 	p := loadedSessionPicker()
-	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyDown})
+	p2, _ := p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if p2.cursor != 1 {
 		t.Errorf("expected cursor=1, got %d", p2.cursor)
 	}
@@ -79,7 +79,7 @@ func TestSessionPickerUpdate_Down(t *testing.T) {
 
 func TestSessionPickerUpdate_UpAtZeroStays(t *testing.T) {
 	p := loadedSessionPicker()
-	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyUp})
+	p2, _ := p.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	if p2.cursor != 0 {
 		t.Errorf("up at 0 should stay 0, got %d", p2.cursor)
 	}
@@ -87,11 +87,11 @@ func TestSessionPickerUpdate_UpAtZeroStays(t *testing.T) {
 
 func TestSessionPickerUpdate_CtrlN_CtrlP(t *testing.T) {
 	p := loadedSessionPicker()
-	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+	p2, _ := p.Update(tea.KeyPressMsg{Code: 'n', Mod: tea.ModCtrl})
 	if p2.cursor != 1 {
 		t.Errorf("ctrl+n should move cursor down: got %d", p2.cursor)
 	}
-	p3, _ := p2.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	p3, _ := p2.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
 	if p3.cursor != 0 {
 		t.Errorf("ctrl+p should move cursor up: got %d", p3.cursor)
 	}
@@ -100,7 +100,7 @@ func TestSessionPickerUpdate_CtrlN_CtrlP(t *testing.T) {
 func TestSessionPickerUpdate_DownCap(t *testing.T) {
 	p := loadedSessionPicker()
 	for range len(testSessionRows) + 5 {
-		p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
+		p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	}
 	if p.cursor >= len(testSessionRows) {
 		t.Errorf("cursor exceeded list: %d >= %d", p.cursor, len(testSessionRows))
@@ -111,7 +111,7 @@ func TestSessionPickerUpdate_DownCap(t *testing.T) {
 
 func TestSessionPickerUpdate_EnterEmitsPickedMsg(t *testing.T) {
 	p := loadedSessionPicker()
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if cmd == nil {
 		t.Fatal("expected cmd after enter")
 	}
@@ -127,9 +127,9 @@ func TestSessionPickerUpdate_EnterEmitsPickedMsg(t *testing.T) {
 
 func TestSessionPickerUpdate_EnterSelectsHighlighted(t *testing.T) {
 	p := loadedSessionPicker()
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	msg := cmd()
 	picked := msg.(sessionPickedMsg)
 	if picked.sessionID != testSessionRows[2].ID {
@@ -139,7 +139,7 @@ func TestSessionPickerUpdate_EnterSelectsHighlighted(t *testing.T) {
 
 func TestSessionPickerUpdate_EscCancels(t *testing.T) {
 	p := loadedSessionPicker()
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	if cmd == nil {
 		t.Fatal("expected cmd after esc")
 	}
@@ -150,7 +150,7 @@ func TestSessionPickerUpdate_EscCancels(t *testing.T) {
 
 func TestSessionPickerUpdate_CtrlC_Cancels(t *testing.T) {
 	p := loadedSessionPicker()
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
 	if cmd == nil {
 		t.Fatal("expected cmd")
 	}
@@ -162,9 +162,9 @@ func TestSessionPickerUpdate_CtrlC_Cancels(t *testing.T) {
 func TestSessionPickerUpdate_NoResultsEnterNoOp(t *testing.T) {
 	p := loadedSessionPicker()
 	for _, ch := range "zzznomatch" {
-		p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		p, _ = p.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 	}
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if cmd != nil {
 		t.Error("enter with no results should return nil cmd")
 	}
@@ -175,7 +175,7 @@ func TestSessionPickerUpdate_NoResultsEnterNoOp(t *testing.T) {
 func TestSessionPickerUpdate_FilterByLabel(t *testing.T) {
 	p := loadedSessionPicker()
 	for _, ch := range "refactor" {
-		p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		p, _ = p.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 	}
 	if len(p.filtered) != 1 {
 		t.Errorf("expected 1 result for 'refactor', got %d", len(p.filtered))
@@ -185,7 +185,7 @@ func TestSessionPickerUpdate_FilterByLabel(t *testing.T) {
 func TestSessionPickerUpdate_FilterByID(t *testing.T) {
 	p := loadedSessionPicker()
 	for _, ch := range "abc1" {
-		p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		p, _ = p.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 	}
 	if len(p.filtered) != 1 {
 		t.Errorf("expected 1 result for 'abc1', got %d", len(p.filtered))
@@ -194,9 +194,9 @@ func TestSessionPickerUpdate_FilterByID(t *testing.T) {
 
 func TestSessionPickerUpdate_FilterResetsCursor(t *testing.T) {
 	p := loadedSessionPicker()
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	p, _ = p.Update(tea.KeyPressMsg{Code: 'g', Text: string('g')})
 	if p.cursor != 0 {
 		t.Errorf("cursor should reset to 0 after filter, got %d", p.cursor)
 	}
@@ -406,7 +406,7 @@ func TestView_ResumeModeShowsPicker(t *testing.T) {
 	m := newTestModel()
 	m.mode = resumeMode
 	m.sessionPicker = newSessionPicker(80, 24)
-	view := m.View()
+	view := m.View().Content
 	if !strings.Contains(strings.ToLower(view), "loading") {
 		t.Errorf("expected session picker in view: %q", view)
 	}

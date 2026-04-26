@@ -1,15 +1,13 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"os/exec"
 	"runtime"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"pigeon/internal/auth"
 )
@@ -20,33 +18,37 @@ import (
 // They are declared as variables rather than iota constants so this file
 // does not need to modify the const block in model.go.
 var (
-	loginSelectMode appMode
-	loginAuthMode   appMode
+	loginSelectMode  appMode
+	loginAuthMode    appMode
+	loginApiKeyMode  appMode
 )
 
 func init() {
-	// Claim the next two free mode slots after permissionMode (= 4).
+	// Claim the next free mode slots after permissionMode (= 4).
 	loginSelectMode = permissionMode + 1
 	loginAuthMode   = permissionMode + 2
+	loginApiKeyMode = permissionMode + 3
 }
 
 // Chrome heights (lines) consumed by the login overlays.
 const (
 	loginSelectChrome = 9  // border×2 + title + blank + providers + blank + hint
 	loginAuthChrome   = 11 // border×2 + title + blank + up-to-5 message lines + blank + hint
+	loginApiKeyChrome = 9  // border×2 + title + blank + instructions + input + blank + hint
 )
 
 // ── provider registry ─────────────────────────────────────────────────────────
 
-// loginProvider describes one OAuth-capable provider.
+// loginProvider describes one login-capable provider.
 type loginProvider struct {
-	id   string
-	name string
+	id       string
+	name     string
+	authType string // "oauth" or "api_key"
 }
 
-// oauthProviders is the ordered list of providers that support OAuth login.
+// oauthProviders is the ordered list of providers that support login.
 var oauthProviders = []loginProvider{
-	{id: "anthropic", name: "Anthropic (Claude Pro / Max)"},
+	{id: "zai", name: "Zai (Coding Plan Subscription)", authType: "api_key"},
 }
 
 // unauthenticatedProviders returns the subset of oauthProviders for which no
@@ -103,7 +105,7 @@ func (m Model) enterLoginSelect() (Model, tea.Cmd) {
 			kind:    bMeta,
 			content: "✓ Already logged in to all supported providers.",
 		})
-		return m, textinput.Blink
+		return m, nil
 	}
 	m.loginProviders = providers
 	m.loginSelectIdx = 0
@@ -112,62 +114,50 @@ func (m Model) enterLoginSelect() (Model, tea.Cmd) {
 	return m, nil
 }
 
-// startLoginAuth starts the OAuth goroutine for the provider at loginSelectIdx.
+// startLoginAuth starts the login flow for the provider at loginSelectIdx.
 func (m Model) startLoginAuth() (Model, tea.Cmd) {
 	if m.loginSelectIdx >= len(m.loginProviders) {
 		return m, nil
 	}
 	p := m.loginProviders[m.loginSelectIdx]
 
+	switch p.authType {
+	case "api_key":
+		return m.enterLoginApiKey(p)
+	case "oauth":
+		return m.startOAuthFlow(p)
+	default:
+		m.appendBlock(chatBlock{kind: bError, content: fmt.Sprintf("unknown auth type: %s", p.authType)})
+		return m, m.input.Focus()
+	}
+}
+
+// enterLoginApiKey switches to API-key input mode for the given provider.
+func (m Model) enterLoginApiKey(p loginProvider) (Model, tea.Cmd) {
+	m.loginLines = []string{
+		fmt.Sprintf("Enter your %s API key.", p.name),
+		"Get your key at: https://zai.chat → Profile → API Key",
+	}
+	m.loginInput.SetValue("")
+	m.mode = loginApiKeyMode
+	return m, m.loginInput.Focus()
+}
+
+// startOAuthFlow starts the OAuth goroutine for the given provider.
+func (m Model) startOAuthFlow(p loginProvider) (Model, tea.Cmd) {
 	m.loginLines = []string{fmt.Sprintf("Connecting to %s…", p.name)}
 	m.loginCh = make(chan loginEventMsg, 32)
 	m.mode = loginAuthMode
 
-	ctx, cancel := context.WithCancel(context.Background())
-	m.loginCancel = cancel
-
 	ch := m.loginCh
 	go func() {
 		defer close(ch)
-
-		switch p.id {
-		case "anthropic":
-			runAnthropicLogin(ctx, ch)
-		default:
-			ch <- loginEventMsg{kind: "err", message: fmt.Sprintf("unknown provider: %s", p.id)}
-		}
+		ch <- loginEventMsg{kind: "err", message: fmt.Sprintf("OAuth not supported for provider: %s", p.id)}
 	}()
 
 	return m, waitForLoginEvent(m.loginCh)
 }
 
-// runAnthropicLogin drives the full Anthropic OAuth flow and sends events to ch.
-func runAnthropicLogin(ctx context.Context, ch chan<- loginEventMsg) {
-	creds, err := auth.Login(ctx, auth.LoginCallbacks{
-		OnAuthURL: func(authURL string) {
-			ch <- loginEventMsg{kind: "url", url: authURL}
-			openBrowserForLogin(authURL)
-		},
-		OnProgress: func(msg string) {
-			ch <- loginEventMsg{kind: "progress", message: msg}
-		},
-	})
-	if err != nil {
-		if ctx.Err() != nil {
-			ch <- loginEventMsg{kind: "err", message: "Login cancelled."}
-		} else {
-			ch <- loginEventMsg{kind: "err", message: "Login failed: " + err.Error()}
-		}
-		return
-	}
-
-	if err := auth.SetAnthropicOAuth(creds); err != nil {
-		ch <- loginEventMsg{kind: "err", message: "Failed to save credentials: " + err.Error()}
-		return
-	}
-
-	ch <- loginEventMsg{kind: "done", message: "✓ Logged in to Anthropic. Credentials saved."}
-}
 
 // openBrowserForLogin tries to open the given URL in the default browser.
 func openBrowserForLogin(url string) {
@@ -187,7 +177,7 @@ func openBrowserForLogin(url string) {
 
 // updateLoginSelect handles input in the provider-selection overlay.
 func (m Model) updateLoginSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
-	key, ok := msg.(tea.KeyMsg)
+	key, ok := msg.(tea.KeyPressMsg)
 	if !ok {
 		return m, nil
 	}
@@ -216,7 +206,7 @@ func (m Model) updateLoginSelect(msg tea.Msg) (tea.Model, tea.Cmd) {
 // updateLoginAuth handles input and incoming events during the OAuth flow.
 func (m Model) updateLoginAuth(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			if m.loginCancel != nil {
@@ -264,11 +254,72 @@ func (m Model) updateLoginAuth(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateLoginApiKey handles input in the API-key entry overlay.
+func (m Model) updateLoginApiKey(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "esc", "ctrl+c":
+			return m.closeLoginApiKey("Login cancelled.")
+		case "enter":
+			key := strings.TrimSpace(m.loginInput.Value())
+			if key == "" {
+				return m, nil // ignore empty submit
+			}
+			if len(m.loginProviders) == 0 || m.loginSelectIdx >= len(m.loginProviders) {
+				return m.closeLoginApiKey("")
+			}
+			p := m.loginProviders[m.loginSelectIdx]
+			switch p.id {
+			case "zai":
+				if err := auth.SetZaiAPIKey(key); err != nil {
+					return m.closeLoginApiKeyErr(fmt.Sprintf("Failed to save Zai API key: %v", err))
+				}
+				// Hot-add the Zai provider.
+				if m.onProviderLogin != nil {
+					m.onProviderLogin("zai")
+				}
+				return m.closeLoginApiKey("✓ Zai API key saved. You can now use Zai models.")
+			default:
+				return m.closeLoginApiKeyErr(fmt.Sprintf("API key login not supported for %s", p.id))
+			}
+		}
+	}
+
+	// Forward other messages (text input updates, etc.) to the login input.
+	var cmd tea.Cmd
+	m.loginInput, cmd = m.loginInput.Update(msg)
+	return m, cmd
+}
+
+func (m Model) closeLoginApiKey(successMsg string) (tea.Model, tea.Cmd) {
+	m.mode = chatMode
+	m.loginLines = nil
+	m.loginInput.SetValue("")
+	m.loginInput.Blur()
+	m.loginProviders = nil
+	if successMsg != "" {
+		m.appendBlock(chatBlock{kind: bMeta, content: successMsg})
+	}
+	return m, m.input.Focus()
+}
+
+func (m Model) closeLoginApiKeyErr(errMsg string) (tea.Model, tea.Cmd) {
+	m.mode = chatMode
+	m.loginLines = nil
+	m.loginInput.SetValue("")
+	m.loginInput.Blur()
+	m.loginProviders = nil
+	if errMsg != "" {
+		m.appendBlock(chatBlock{kind: bError, content: errMsg})
+	}
+	return m, m.input.Focus()
+}
+
 func (m Model) closeLoginSelect() (tea.Model, tea.Cmd) {
 	m.mode = chatMode
 	m.loginProviders = nil
-	m.input.Focus()
-	return m, textinput.Blink
+	return m, m.input.Focus()
 }
 
 func (m Model) closeLoginAuth(successMsg string) (tea.Model, tea.Cmd) {
@@ -283,11 +334,10 @@ func (m Model) closeLoginAuth(successMsg string) (tea.Model, tea.Cmd) {
 	m.loginCh = nil
 	m.loginCancel = nil
 	m.loginProviders = nil
-	m.input.Focus()
 	if successMsg != "" {
 		m.appendBlock(chatBlock{kind: bMeta, content: successMsg})
 	}
-	return m, textinput.Blink
+	return m, m.input.Focus()
 }
 
 func (m Model) closeLoginAuthErr(errMsg string) (tea.Model, tea.Cmd) {
@@ -296,11 +346,10 @@ func (m Model) closeLoginAuthErr(errMsg string) (tea.Model, tea.Cmd) {
 	m.loginCh = nil
 	m.loginCancel = nil
 	m.loginProviders = nil
-	m.input.Focus()
 	if errMsg != "" {
 		m.appendBlock(chatBlock{kind: bError, content: errMsg})
 	}
-	return m, textinput.Blink
+	return m, m.input.Focus()
 }
 
 // ── View helpers ──────────────────────────────────────────────────────────────
@@ -371,13 +420,44 @@ func (m Model) renderLoginAuth() string {
 	return lipgloss.NewStyle().Width(m.width).Render(box)
 }
 
+// renderLoginApiKey renders the API-key entry dialog.
+func (m Model) renderLoginApiKey() string {
+	dialogW := m.width - 4
+	if dialogW < 40 {
+		dialogW = 40
+	}
+	innerW := dialogW - 4
+
+	var b strings.Builder
+	title := "🔑 Login"
+	if len(m.loginProviders) > 0 && m.loginSelectIdx < len(m.loginProviders) {
+		title = fmt.Sprintf("🔑 Login to %s", m.loginProviders[m.loginSelectIdx].name)
+	}
+	b.WriteString(loginTitleStyle.Render(title) + "\n")
+	b.WriteString("\n")
+
+	for _, l := range m.loginLines {
+		if lipgloss.Width(l) > innerW {
+			l = l[:innerW-1] + "…"
+		}
+		b.WriteString(loginProgressStyle.Render(l) + "\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(m.loginInput.View() + "\n")
+	b.WriteString(loginHintStyle.Render("enter to submit  •  esc to cancel"))
+
+	box := loginBorderStyle.Width(innerW).Render(b.String())
+	return lipgloss.NewStyle().Width(m.width).Render(box)
+}
+
 // ── view integration ──────────────────────────────────────────────────────────
 
 // viewChatWithLoginSelect renders the chat viewport with the provider-selector
 // overlay at the bottom.
 func (m Model) viewChatWithLoginSelect(header string) string {
 	var statusLine string
-	if below := m.vp.TotalLineCount() - m.vp.YOffset - m.vp.Height; below > 0 {
+	if below := m.vp.TotalLineCount() - m.vp.YOffset() - m.vp.Height(); below > 0 {
 		statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more  ", below))
 	}
 	if statusLine == "" {
@@ -389,13 +469,25 @@ func (m Model) viewChatWithLoginSelect(header string) string {
 // viewChatWithLoginAuth renders the chat viewport with the auth-flow overlay.
 func (m Model) viewChatWithLoginAuth(header string) string {
 	var statusLine string
-	if below := m.vp.TotalLineCount() - m.vp.YOffset - m.vp.Height; below > 0 {
+	if below := m.vp.TotalLineCount() - m.vp.YOffset() - m.vp.Height(); below > 0 {
 		statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more  ", below))
 	}
 	if statusLine == "" {
 		statusLine = " "
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, "", m.vp.View(), statusLine, m.renderLoginAuth())
+}
+
+// viewChatWithLoginApiKey renders the chat viewport with the API-key entry overlay.
+func (m Model) viewChatWithLoginApiKey(header string) string {
+	var statusLine string
+	if below := m.vp.TotalLineCount() - m.vp.YOffset() - m.vp.Height(); below > 0 {
+		statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more  ", below))
+	}
+	if statusLine == "" {
+		statusLine = " "
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, header, "", m.vp.View(), statusLine, m.renderLoginApiKey())
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -412,6 +504,21 @@ func truncURL(u string, maxLen int) string {
 		return u
 	}
 	return u[:maxLen-1] + "…"
+}
+
+// handleLogout removes credentials for the given provider (or all if none specified).
+func (m Model) handleLogout(args []string) (tea.Model, tea.Cmd) {
+	if len(args) == 0 {
+		m.appendBlock(chatBlock{kind: bError, content: "Usage: /logout <provider>  (e.g. /logout zai)"})
+		return m, m.input.Focus()
+	}
+	provider := args[0]
+	if err := auth.RemoveProvider(provider); err != nil {
+		m.appendBlock(chatBlock{kind: bError, content: fmt.Sprintf("Failed to logout %s: %v", provider, err)})
+		return m, m.input.Focus()
+	}
+	m.appendBlock(chatBlock{kind: bAssistant, content: fmt.Sprintf("Logged out %s.", provider)})
+	return m, m.input.Focus()
 }
 
 // ── styles ────────────────────────────────────────────────────────────────────

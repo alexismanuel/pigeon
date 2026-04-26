@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"pigeon/internal/agent"
 	"pigeon/internal/config"
@@ -304,11 +304,15 @@ func TestUpdateChat_TurnDone_ClearsRunning(t *testing.T) {
 
 func TestUpdateChat_TurnDone_AppendsHistory(t *testing.T) {
 	m := runningModel()
-	msgs := []openrouter.Message{
-		{Role: "user", Content: "q"},
-		{Role: "assistant", Content: "a"},
-	}
-	next, _ := m.Update(turnDoneMsg{newMessages: msgs})
+	// Simulate what submitPrompt does: add user message to history.
+	m.history = append(m.history, openrouter.Message{Role: "user", Content: "q"})
+	// In the new per-message persistence flow, assistantRoundMsg persists
+	// the assistant message before turnDoneMsg arrives.
+	next, _ := m.Update(assistantRoundMsg{message: openrouter.Message{
+		Role:       "assistant",
+		Content:    "a",
+		StopReason: "complete",
+	}})
 	tm := next.(Model)
 	if len(tm.history) != 2 {
 		t.Errorf("expected 2 history messages, got %d", len(tm.history))
@@ -442,7 +446,7 @@ func TestSubmitPrompt_NilAgentAddsError(t *testing.T) {
 func pickerModel() Model {
 	m := newTestModel()
 	m.mode = pickerMode
-	m.picker = newPicker(80, 24, nil)
+	m.picker = newPicker(80, 24, nil, "")
 	return m
 }
 
@@ -683,38 +687,17 @@ func TestUpdate_WindowSizeMsg_SetsViewportDimensions(t *testing.T) {
 	m := newTestModel()
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	tm := next.(Model)
-	if tm.vp.Width != 120 {
-		t.Errorf("expected vp.Width=120, got %d", tm.vp.Width)
+	if tm.vp.Width() != 120 {
+		t.Errorf("expected vp.Width=120, got %d", tm.vp.Width())
 	}
-	if tm.vp.Height <= 0 {
-		t.Errorf("expected positive vp.Height, got %d", tm.vp.Height)
-	}
-}
-
-func TestUpdate_MouseWheelUp_DisablesAutoScroll(t *testing.T) {
-	m := newTestModel()
-	// give it a real size so viewport is usable
-	next0, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	m = next0.(Model)
-	next, _ := m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
-	tm := next.(Model)
-	if tm.autoScroll {
-		t.Error("autoScroll should be false after wheel up")
+	if tm.vp.Height() <= 0 {
+		t.Errorf("expected positive vp.Height, got %d", tm.vp.Height())
 	}
 }
 
-func TestUpdate_MouseWheelDown_AtBottomReenablesAutoScroll(t *testing.T) {
-	m := newTestModel()
-	m.autoScroll = false
-	next1, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	m = next1.(Model)
-	// wheel down when already at bottom → should re-enable autoScroll
-	next, _ := m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
-	tm := next.(Model)
-	if !tm.autoScroll {
-		t.Error("autoScroll should be re-enabled when viewport is at bottom")
-	}
-}
+// Mouse wheel events are no longer captured by the TUI (no WithMouseCellMotion).
+// The terminal (WezTerm, etc.) handles mouse scroll and selection natively.
+// Viewport scroll is available via Page Up / Page Down.
 
 func TestRecalcViewport_ChromeIncludesSuggestions(t *testing.T) {
 	m := newTestModel()
@@ -723,8 +706,8 @@ func TestRecalcViewport_ChromeIncludesSuggestions(t *testing.T) {
 	m.suggestions = make([]commandDef, 3)
 
 	plain := m.recalcViewport()
-	if plain.vp.Height != max(3, 30-4-3) {
-		t.Errorf("unexpected height with 3 suggestions: %d", plain.vp.Height)
+	if plain.vp.Height() != max(3, 30-4-3) {
+		t.Errorf("unexpected height with 3 suggestions: %d", plain.vp.Height())
 	}
 }
 

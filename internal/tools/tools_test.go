@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -71,18 +73,18 @@ func TestExecutorBashAndTimeout(t *testing.T) {
 	}
 }
 
-func TestTruncateOutput(t *testing.T) {
+func TestTruncateOutputTail(t *testing.T) {
 	in := "1\n2\n3\n4"
-	out, truncated := truncateOutput(in, 2, 100)
+	out, truncated := truncateOutputTail(in, 2, 100)
 	if !truncated {
 		t.Fatalf("expected truncated=true")
 	}
-	if out != "1\n2" {
+	if out != "3\n4" {
 		t.Fatalf("unexpected output: %q", out)
 	}
 
-	out, truncated = truncateOutput("abcdef", 100, 3)
-	if !truncated || out != "abc" {
+	out, truncated = truncateOutputTail("abcdef", 100, 3)
+	if !truncated || out != "def" {
 		t.Fatalf("unexpected byte truncation: out=%q truncated=%v", out, truncated)
 	}
 }
@@ -166,5 +168,71 @@ func TestExecutorUnknownTool(t *testing.T) {
 	_, _, err := e.Execute(context.Background(), "nonexistent", "{}")
 	if err == nil {
 		t.Error("expected error for unknown tool")
+	}
+}
+
+func TestTruncateOutputTail_KeepsTail(t *testing.T) {
+	lines := make([]string, 10)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line%d", i)
+	}
+	in := strings.Join(lines, "\n")
+	out, truncated := truncateOutputTail(in, 3, 1024)
+	if !truncated {
+		t.Fatal("expected truncated")
+	}
+	if !strings.Contains(out, "line7") || !strings.Contains(out, "line9") {
+		t.Errorf("expected last 3 lines, got: %q", out)
+	}
+	if strings.Contains(out, "line0") {
+		t.Errorf("should not contain first line: %q", out)
+	}
+}
+
+func TestTruncateOutputTail_NoTruncation(t *testing.T) {
+	out, truncated := truncateOutputTail("short", 100, 1024)
+	if truncated {
+		t.Error("should not truncate short input")
+	}
+	if out != "short" {
+		t.Errorf("unexpected: %q", out)
+	}
+}
+
+func TestReadFileLines_ByteBudget(t *testing.T) {
+	// Each line is ~100 chars. With a 250 byte budget, should stop before 3 lines.
+	line := strings.Repeat("x", 100)
+	content := line + "\n" + line + "\n" + line + "\n" + line
+	f := writeTempFile(t, content)
+	lines, hasMore, err := readFileLines(f, 0, 100, 250)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMore {
+		t.Error("expected hasMore=true (byte budget exceeded)")
+	}
+	if len(lines) > 3 {
+		t.Errorf("byte budget should have limited lines, got %d", len(lines))
+	}
+}
+
+func TestWriteTruncationTempFile(t *testing.T) {
+	path, err := writeTruncationTempFile("test output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(path)
+	if !strings.HasPrefix(path, os.TempDir()) {
+		t.Errorf("expected temp dir, got: %s", path)
+	}
+	if !strings.Contains(path, "pigeon-bash-") {
+		t.Errorf("expected pigeon-bash prefix, got: %s", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "test output" {
+		t.Errorf("unexpected content: %q", data)
 	}
 }

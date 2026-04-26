@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/aymanbagabas/go-udiff"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 // ── styles ────────────────────────────────────────────────────────────────────
@@ -52,7 +52,7 @@ func buildEditDiff(path, oldContent, newContent string) editDiffResult {
 
 	additions, removals := countStats(unified)
 	summary := fmt.Sprintf("Edited %s (+%d -%d)", path, additions, removals)
-	display := renderColorizedDiff(path, unified, additions, removals)
+	display := renderColorizedDiff(unified, additions, removals)
 	return editDiffResult{summary: summary, display: display}
 }
 
@@ -74,11 +74,10 @@ func countStats(unified udiff.UnifiedDiff) (additions, removals int) {
 
 // ── renderer ─────────────────────────────────────────────────────────────────
 
-func renderColorizedDiff(path string, unified udiff.UnifiedDiff, additions, removals int) string {
+func renderColorizedDiff(unified udiff.UnifiedDiff, additions, removals int) string {
 	var b strings.Builder
 
-	// Stats header line.
-	b.WriteString(diffStatFile.Render(path + "  "))
+	// Stats header line (path already shown in the tool-call header above).
 	b.WriteString(diffStatAdd.Render(fmt.Sprintf("+%d", additions)))
 	b.WriteString(diffStatFile.Render("  "))
 	b.WriteString(diffStatDel.Render(fmt.Sprintf("-%d", removals)))

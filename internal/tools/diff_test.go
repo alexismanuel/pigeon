@@ -1,18 +1,20 @@
 package tools
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/aymanbagabas/go-udiff"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/termenv"
 )
 
-// forceColor makes lipgloss emit ANSI in non-TTY test environments.
-func forceColor() {
-	lipgloss.SetColorProfile(termenv.TrueColor)
-}
+// stripANSI removes all ANSI escape sequences from s.
+var ansiRe = regexp.MustCompile("\x1b[^m]*m")
+
+func stripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
+
+// forceColor is a no-op in lipgloss v2 (color profile is controlled per renderer).
+func forceColor() {}
 
 // ── buildEditDiff ─────────────────────────────────────────────────────────────
 
@@ -45,8 +47,9 @@ func TestBuildEditDiff_changes(t *testing.T) {
 	if res.display == "" {
 		t.Error("display should not be empty when content changed")
 	}
-	if !strings.Contains(res.display, "foo.go") {
-		t.Errorf("display missing filename: %q", res.display)
+	// Verify the display contains diff content (stats line and hunk marker).
+	if !strings.Contains(res.display, "@@") {
+		t.Errorf("display missing hunk marker: %q", res.display)
 	}
 }
 
@@ -90,11 +93,11 @@ func TestRenderChangedLine_textContent(t *testing.T) {
 	if !strings.Contains(insLine, "hello ") {
 		t.Errorf("ins line missing unchanged prefix: %q", insLine)
 	}
-	// Each line must contain the changed word.
-	if !strings.Contains(delLine, "world") {
+	// Each line must contain the changed word (strip ANSI escapes for comparison).
+	if !strings.Contains(stripANSI(delLine), "world") {
 		t.Errorf("del line missing removed word: %q", delLine)
 	}
-	if !strings.Contains(insLine, "earth") {
+	if !strings.Contains(stripANSI(insLine), "earth") {
 		t.Errorf("ins line missing inserted word: %q", insLine)
 	}
 }
@@ -128,10 +131,9 @@ func TestRenderChangedLine_identical(t *testing.T) {
 
 // ansiDelHigh and ansiInsHigh are the 24-bit background ANSI sequences that
 // lipgloss emits for the highlight styles (#7a2f2f and #2f7a30 respectively).
-// termenv converts hex → RGB with a floor divide so 0x7a (122) renders as 121.
 const (
-	ansiDelHigh = "48;2;121;47;47" // diffDelHighStyle background
-	ansiInsHigh = "48;2;47;121;48" // diffAddHighStyle background
+	ansiDelHigh = "48;2;122;47;47" // diffDelHighStyle background
+	ansiInsHigh = "48;2;47;122;48" // diffAddHighStyle background
 )
 
 func TestRenderLineWithHighlights_highlightsApplied(t *testing.T) {

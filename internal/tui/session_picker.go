@@ -5,9 +5,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ── messages ──────────────────────────────────────────────────────────────────
@@ -64,9 +64,13 @@ func newSessionPicker(width, height int) sessionPicker {
 	ti.Placeholder = "Filter sessions…"
 	ti.Focus()
 	ti.CharLimit = 0
-	ti.Width = max(20, width-6)
-	ti.PromptStyle = pickerPromptStyle
-	ti.TextStyle = pickerInputTextStyle
+	ti.SetWidth(max(20, width-6))
+	{
+		s := ti.Styles()
+		s.Focused.Prompt = pickerPromptStyle
+		s.Focused.Text = pickerInputTextStyle
+		ti.SetStyles(s)
+	}
 
 	return sessionPicker{
 		input:   ti,
@@ -89,7 +93,7 @@ func (p sessionPicker) Update(msg tea.Msg) (sessionPicker, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		p.width = msg.Width
 		p.height = msg.Height
-		p.input.Width = max(20, msg.Width-6)
+		p.input.SetWidth(max(20, msg.Width-6))
 		return p, nil
 
 	case sessionsLoadedMsg:
@@ -106,7 +110,7 @@ func (p sessionPicker) Update(msg tea.Msg) (sessionPicker, tea.Cmd) {
 		p.err = msg.err
 		return p, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			return p, func() tea.Msg { return sessionPickCanceledMsg{} }

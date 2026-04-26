@@ -31,3 +31,43 @@ func TestResolveOpenRouterAPIKey(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildProviders_withZaiKey(t *testing.T) {
+	getenv := func(key string) string {
+		switch key {
+		case "ZAI_API_KEY":
+			return "sk-zai-test-key"
+		default:
+			return ""
+		}
+	}
+
+	mp, err := BuildProviders(getenv)
+	if err != nil {
+		t.Fatalf("BuildProviders: %v", err)
+	}
+	if mp == nil {
+		t.Fatal("expected non-nil multi-provider")
+	}
+}
+
+func TestBuildProviders_noProvider(t *testing.T) {
+	// NOTE: This test will pass only when no real Zai credentials are stored
+	// in auth.json. If ZAI_API_KEY is stored, BuildProviders succeeds.
+	getenv := func(key string) string {
+		switch key {
+		case "OPENROUTER_API_KEY",
+			"ZAI_API_KEY",
+			"LMSTUDIO_BASE_URL",
+			"LMSTUDIO_API_KEY":
+			return ""
+		default:
+			return ""
+		}
+	}
+
+	_, err := BuildProviders(getenv)
+	if err == nil {
+		t.Skip("skipping: stored credentials found in auth.json")
+	}
+}

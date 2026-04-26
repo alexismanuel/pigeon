@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"pigeon/internal/provider/openrouter"
 	"pigeon/internal/session"
@@ -93,7 +93,7 @@ func (p nodePicker) Update(msg tea.Msg) (nodePicker, tea.Cmd) {
 		p.height = msg.Height
 		return p, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			return p, func() tea.Msg { return nodePickCanceledMsg{} }
@@ -371,7 +371,8 @@ func nodeDisplayInfo(msg openrouter.Message) (role, preview string) {
 		return " sys", nodePreviewText(msg.Content)
 
 	case "cmd":
-		return " cmd", msg.Content
+		first := strings.SplitN(msg.Content, "\n", 2)[0]
+		return " cmd", first
 
 	default:
 		return msg.Role, nodePreviewText(msg.Content)

@@ -6,30 +6,29 @@ import (
 	"strings"
 
 	"pigeon/internal/auth"
-	anthropicclient "pigeon/internal/provider/anthropic"
 	"pigeon/internal/provider/lmstudio"
 	"pigeon/internal/provider/multi"
 	"pigeon/internal/provider/openrouter"
+	zaiclient "pigeon/internal/provider/zai"
 )
 
 const OpenRouterAPIKeyEnv = "OPENROUTER_API_KEY"
-const AnthropicAPIKeyEnv = "ANTHROPIC_API_KEY"
+const ZaiAPIKeyEnv = "ZAI_API_KEY"
 
 // BuildProviders constructs a MultiProvider populated with every provider for
-// which credentials are available.  At least one of the following must be
+// which credentials are available. At least one of the following must be
 // satisfied or an error is returned:
 //
-//   - OPENROUTER_API_KEY env var is set
-//   - ANTHROPIC_API_KEY env var is set
-//   - Anthropic OAuth credentials exist in ~/.config/pigeon/auth.json
-//   - LMSTUDIO_BASE_URL is set or LM Studio is reachable at localhost:1234
+//	- OPENROUTER_API_KEY env var is set
+//	- ZAI_API_KEY env var is set or Zai credentials exist in auth.json
+//	- LMSTUDIO_BASE_URL is set or LM Studio is reachable at localhost:1234
 //
 // The returned MultiProvider implements both the StreamingClient and
 // modelCatalog interfaces used throughout pigeon.
 //
 // Provider priority for the default fallback is:
 //  1. OpenRouter (if configured)
-//  2. Anthropic (if configured)
+//  2. Zai (if configured)
 //  3. LM Studio
 func BuildProviders(getenv func(string) string) (*multi.Provider, error) {
 	if getenv == nil {
@@ -43,34 +42,32 @@ func BuildProviders(getenv func(string) string) (*multi.Provider, error) {
 		mp.Add("openrouter", openrouter.NewClient(key, nil))
 	}
 
-	// ── Anthropic ────────────────────────────────────────────────────────────
-	anthropicKey := strings.TrimSpace(getenv(AnthropicAPIKeyEnv))
-	if anthropicKey == "" {
-		// Try credentials stored by the OAuth login flow.
-		storedKey, err := auth.GetAnthropicToken()
+	// ── Zai (Zecoba) ──────────────────────────────────────────────────────────
+	zaiKey := strings.TrimSpace(getenv(ZaiAPIKeyEnv))
+	if zaiKey == "" {
+		// Try credentials stored by the login flow.
+		storedKey, err := auth.GetZaiAPIKey()
 		if err == nil {
-			anthropicKey = storedKey
+			zaiKey = storedKey
 		}
 	}
-	if anthropicKey != "" {
-		mp.Add("anthropic", anthropicclient.NewClient(anthropicKey, nil))
+	if zaiKey != "" {
+		mp.Add("zai", zaiclient.NewClient(zaiKey, nil))
 	}
 
 	// ── LM Studio ────────────────────────────────────────────────────────────
 	// LM Studio is always registered — it gracefully returns an empty model
 	// list when the server is not running.
-	mp.Add("lmstudio", lmstudio.NewClient("", "", nil))
+	lmStudioAPIKey := strings.TrimSpace(getenv("LMSTUDIO_API_KEY"))
+	mp.Add("lmstudio", lmstudio.NewClient("", lmStudioAPIKey, nil))
 
 	// Require at least one real (non-LM-Studio) provider so that the user
 	// gets a clear error message rather than a confusing empty model list.
-	if strings.TrimSpace(getenv(OpenRouterAPIKeyEnv)) == "" && anthropicKey == "" {
-		// Only LM Studio is available.  That's allowed if LM Studio is
-		// configured explicitly.
-		if strings.TrimSpace(getenv("LMSTUDIO_BASE_URL")) == "" {
+	if strings.TrimSpace(getenv(OpenRouterAPIKeyEnv)) == "" && zaiKey == "" {
+		if strings.TrimSpace(getenv("LMSTUDIO_BASE_URL")) == "" && lmStudioAPIKey == "" {
 			return nil, fmt.Errorf(
-				"no provider configured: set %s, %s, or LMSTUDIO_BASE_URL, "+
-					"or run `pigeon login` to authenticate with Anthropic",
-				OpenRouterAPIKeyEnv, AnthropicAPIKeyEnv,
+				"no provider configured: set %s, %s, LMSTUDIO_BASE_URL, or LMSTUDIO_API_KEY",
+				OpenRouterAPIKeyEnv, ZaiAPIKeyEnv,
 			)
 		}
 	}

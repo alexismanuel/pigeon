@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 const modelsDevURL = "https://models.dev/api.json"

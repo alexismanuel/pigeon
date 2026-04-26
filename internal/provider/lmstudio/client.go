@@ -71,6 +71,7 @@ func (c *Client) ListModels(ctx context.Context) ([]openrouter.ModelInfo, error)
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	c.setAuth(req)
+	req.Header.Set("User-Agent", "pigeon")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -152,6 +153,7 @@ func (c *Client) StreamChatCompletion(
 		return openrouter.Message{}, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "pigeon")
 	c.setAuth(req)
 
 	resp, err := c.httpClient.Do(req)

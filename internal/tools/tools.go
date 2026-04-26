@@ -3,6 +3,8 @@ package tools
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +23,7 @@ const (
 	readMaxFileSize  = 5 * 1024 * 1024 // 5 MB — refuse to load larger files
 	readDefaultLimit = 2000             // lines returned when no limit is given
 	readMaxLineLen   = 2000             // chars per line; longer lines are trimmed
+	readMaxBytes     = 50 * 1024       // 50 KB — byte budget for read output
 )
 
 const (
@@ -63,7 +66,7 @@ func (e *Executor) Definitions() []openrouter.ToolDefinition {
 			Function: openrouter.ToolFunctionDefinition{
 				Name: "read",
 				Description: "Read a text file with line numbers. " +
-					"Returns up to 2000 lines by default. " +
+					"Output is truncated to 2000 lines or 50KB (whichever is hit first). " +
 					"Use offset (1-based) and limit to paginate large files. " +
 					"Each output line is prefixed with its line number so you can reference exact lines in follow-up edits.",
 				Parameters: map[string]any{
@@ -112,7 +115,7 @@ func (e *Executor) Definitions() []openrouter.ToolDefinition {
 			Type: "function",
 			Function: openrouter.ToolFunctionDefinition{
 				Name:        "bash",
-				Description: "Execute a bash command in the current working directory.",
+				Description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to the last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -135,7 +138,7 @@ func (e *Executor) Execute(ctx context.Context, name, argumentsJSON string) (res
 	case "read":
 		result, display, err = e.execRead(argumentsJSON)
 	case "write":
-		result, err = e.execWrite(ctx, argumentsJSON)
+		result, display, err = e.execWrite(ctx, argumentsJSON)
 	case "edit":
 		result, display, err = e.execEdit(ctx, argumentsJSON)
 	case "bash":
@@ -193,7 +196,7 @@ func (e *Executor) execRead(argumentsJSON string) (result, display string, err e
 	}
 
 	// ── buffered read ─────────────────────────────────────────────────────────
-	lines, hasMore, readErr := readFileLines(path, offset, limit)
+	lines, hasMore, readErr := readFileLines(path, offset, limit, readMaxBytes)
 	if readErr != nil {
 		return "", "", fmt.Errorf("read %s: %w", path, readErr)
 	}
@@ -210,8 +213,8 @@ func (e *Executor) execRead(argumentsJSON string) (result, display string, err e
 	result = addReadLineNumbers(lines, startLine)
 	if hasMore {
 		lastLine := startLine + len(lines) - 1
-		result += fmt.Sprintf("\n\n[truncated — file continues beyond line %d; use offset=%d to read more]",
-			lastLine, lastLine+1)
+		result += fmt.Sprintf("\n\n[Showing lines %d-%d. Use offset=%d to continue.]",
+			startLine, lastLine, lastLine+1)
 	}
 
 	// ── TUI display: syntax-highlighted with gutter ───────────────────────────
@@ -223,8 +226,9 @@ func (e *Executor) execRead(argumentsJSON string) (result, display string, err e
 // readFileLines reads [offset, offset+limit) lines from path using a buffered
 // scanner so large files are never fully loaded into memory.
 // offset is 0-based. hasMore is true when the file contains more lines beyond
-// the returned slice.
-func readFileLines(path string, offset, limit int) (lines []string, hasMore bool, err error) {
+// the returned slice. maxBytes caps cumulative output size; when exceeded the
+// last collected line is discarded and hasMore is set to true.
+func readFileLines(path string, offset, limit, maxBytes int) (lines []string, hasMore bool, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, false, err
@@ -242,18 +246,27 @@ func readFileLines(path string, offset, limit int) (lines []string, hasMore bool
 		return nil, false, err
 	}
 
-	// Collect up to limit lines, capping each line's length.
+	// Collect up to limit lines, capping each line's length and total bytes.
 	lines = make([]string, 0, limit)
+	var totalBytes int
 	for len(lines) < limit && scanner.Scan() {
 		line := scanner.Text()
 		if len(line) > readMaxLineLen {
 			line = line[:readMaxLineLen] + "…"
 		}
+		if totalBytes+len(line) > maxBytes && len(lines) > 0 {
+			// Would exceed byte budget — stop before this line.
+			hasMore = true
+			break
+		}
 		lines = append(lines, line)
+		totalBytes += len(line)
 	}
 
-	// Peek at one more line to know if the file continues.
-	hasMore = len(lines) == limit && scanner.Scan()
+	// If stopped by line limit, peek at one more line.
+	if !hasMore && len(lines) == limit && scanner.Scan() {
+		hasMore = true
+	}
 
 	if err = scanner.Err(); err != nil {
 		return nil, false, err
@@ -314,19 +327,20 @@ type writeArgs struct {
 	Content string `json:"content"`
 }
 
-func (e *Executor) execWrite(ctx context.Context, argumentsJSON string) (string, error) {
+func (e *Executor) execWrite(ctx context.Context, argumentsJSON string) (result, display string, err error) {
 	var args writeArgs
-	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
-		return "", fmt.Errorf("invalid arguments: %w", err)
+	if err = json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
+		return "", "", fmt.Errorf("invalid arguments: %w", err)
 	}
 	if strings.TrimSpace(args.Path) == "" {
-		return "", errors.New("path is required")
+		return "", "", errors.New("path is required")
 	}
 	path := e.resolvePath(args.Path)
 
 	if e.permissions != nil {
 		sessionID := permission.SessionIDFromContext(ctx)
-		granted, err := e.permissions.Request(ctx, permission.CreatePermissionRequest{
+		var granted bool
+		granted, err = e.permissions.Request(ctx, permission.CreatePermissionRequest{
 			SessionID:   sessionID,
 			ToolName:    "write",
 			Action:      "create",
@@ -335,20 +349,40 @@ func (e *Executor) execWrite(ctx context.Context, argumentsJSON string) (string,
 			Params:      permission.WriteParams{Path: path, Content: args.Content},
 		})
 		if err != nil {
-			return "", fmt.Errorf("permission denied: %w", err)
+			return "", "", fmt.Errorf("%s", permDeniedMessage("write", path, err))
 		}
 		if !granted {
-			return "", errors.New("permission denied")
+			return "", "", fmt.Errorf("%s", permDeniedMessage("write", path, nil))
 		}
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", fmt.Errorf("create parent directories for %s: %w", path, err)
+	// Detect new file vs overwrite.
+	_, statErr := os.Stat(path)
+	isNew := statErr != nil
+
+	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", "", fmt.Errorf("create parent directories for %s: %w", path, err)
 	}
-	if err := os.WriteFile(path, []byte(args.Content), 0o644); err != nil {
-		return "", fmt.Errorf("write %s: %w", path, err)
+	if err = os.WriteFile(path, []byte(args.Content), 0o644); err != nil {
+		return "", "", fmt.Errorf("write %s: %w", path, err)
 	}
-	return fmt.Sprintf("Wrote %d bytes to %s", len(args.Content), path), nil
+
+	lineCount := strings.Count(args.Content, "\n")
+	if args.Content != "" && !strings.HasSuffix(args.Content, "\n") {
+		lineCount++
+	}
+
+	// Model-facing summary.
+	if isNew {
+		result = fmt.Sprintf("Created %s (%d lines, %d bytes)", path, lineCount, len(args.Content))
+	} else {
+		result = fmt.Sprintf("Wrote %s (%d lines, %d bytes)", path, lineCount, len(args.Content))
+	}
+
+	// TUI display: syntax-highlighted preview with line numbers.
+	display = renderWriteDisplay(args.Path, args.Content)
+
+	return result, display, nil
 }
 
 type editArgs struct {
@@ -378,10 +412,10 @@ func (e *Executor) execEdit(ctx context.Context, argumentsJSON string) (result, 
 			Params:      permission.EditParams{Path: path, OldText: args.OldText, NewText: args.NewText},
 		})
 		if permErr != nil {
-			return "", "", fmt.Errorf("permission denied: %w", permErr)
+			return "", "", fmt.Errorf("%s", permDeniedMessage("edit", path, permErr))
 		}
 		if !granted {
-			return "", "", errors.New("permission denied")
+			return "", "", fmt.Errorf("%s", permDeniedMessage("edit", path, nil))
 		}
 	}
 
@@ -432,10 +466,10 @@ func (e *Executor) execBash(ctx context.Context, argumentsJSON string) (string, 
 			Params:      permission.BashParams{Command: args.Command},
 		})
 		if err != nil {
-			return "", fmt.Errorf("permission denied: %w", err)
+			return "", fmt.Errorf("%s", permDeniedMessage("bash", e.baseDir, err))
 		}
 		if !granted {
-			return "", errors.New("permission denied")
+			return "", fmt.Errorf("%s", permDeniedMessage("bash", e.baseDir, nil))
 		}
 	}
 
@@ -454,9 +488,14 @@ func (e *Executor) execBash(ctx context.Context, argumentsJSON string) (string, 
 	if strings.TrimSpace(text) == "" {
 		text = "(no output)"
 	}
-	text, wasTruncated := truncateOutput(text, e.maxLines, e.maxBytes)
+	text, wasTruncated := truncateOutputTail(text, e.maxLines, e.maxBytes)
 	if wasTruncated {
-		text += "\n\n[output truncated]"
+		tmpPath, tmpErr := writeTruncationTempFile(text)
+		if tmpErr == nil {
+			text += fmt.Sprintf("\n\n[output truncated. Full output: %s]", tmpPath)
+		} else {
+			text += "\n\n[output truncated]"
+		}
 	}
 
 	if err != nil {
@@ -475,7 +514,9 @@ func (e *Executor) resolvePath(path string) string {
 	return filepath.Join(e.baseDir, path)
 }
 
-func truncateOutput(input string, maxLines, maxBytes int) (string, bool) {
+// truncateOutputTail keeps the last maxLines lines (up to maxBytes) of input.
+// Bash output is most useful at the end — errors, exit codes, final results.
+func truncateOutputTail(input string, maxLines, maxBytes int) (string, bool) {
 	if maxLines <= 0 {
 		maxLines = defaultOutputMaxLines
 	}
@@ -484,22 +525,57 @@ func truncateOutput(input string, maxLines, maxBytes int) (string, bool) {
 	}
 
 	lines := strings.Split(input, "\n")
-	truncated := false
+	if len(lines) <= maxLines && len(input) <= maxBytes {
+		return input, false
+	}
+
+	// Keep the last maxLines lines.
 	if len(lines) > maxLines {
-		lines = lines[:maxLines]
-		truncated = true
+		lines = lines[len(lines)-maxLines:]
 	}
 	out := strings.Join(lines, "\n")
 	if len(out) <= maxBytes {
-		return out, truncated
+		return out, true
 	}
-	truncated = true
+
+	// Byte truncation: keep the tail.
 	b := []byte(out)
 	if len(b) > maxBytes {
-		b = b[:maxBytes]
+		b = b[len(b)-maxBytes:]
 	}
-	for !utf8.Valid(b) && len(b) > 0 {
-		b = b[:len(b)-1]
+	// Align to valid UTF-8 boundary.
+	for len(b) > 0 && !utf8.RuneStart(b[0]) {
+		b = b[1:]
 	}
-	return string(b), truncated
+	return string(b), true
+}
+
+// writeTruncationTempFile writes content to a temp file and returns its path.
+func writeTruncationTempFile(content string) (string, error) {
+	id := make([]byte, 8)
+	if _, err := rand.Read(id); err != nil {
+		return "", err
+	}
+	name := fmt.Sprintf("pigeon-bash-%s.log", hex.EncodeToString(id))
+	path := filepath.Join(os.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// permDeniedMessage builds a rich error message sent back to the LLM agent
+// when a tool call is denied by the user.  It explains what happened and
+// suggests alternatives so the agent can recover gracefully.
+func permDeniedMessage(tool, path string, err error) string {
+	var detail string
+	if err != nil {
+		detail = fmt.Sprintf(" (%s)", err.Error())
+	}
+	return fmt.Sprintf(
+		"Permission denied: %s on %s was blocked by the user%s. "+
+			"Do not retry this exact operation without asking the user first. "+
+			"Consider asking the user for guidance or proposing an alternative approach.",
+		tool, path, detail,
+	)
 }

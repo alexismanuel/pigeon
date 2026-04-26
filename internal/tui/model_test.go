@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"pigeon/internal/config"
 	"pigeon/internal/provider/openrouter"
@@ -334,7 +334,7 @@ func newTestModel() Model {
 
 func typeInto(m Model, chars string) Model {
 	for _, ch := range chars {
-		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		next, _ := m.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 		m = next.(Model)
 	}
 	return m
@@ -375,14 +375,14 @@ func TestSuggestions_NavWithArrowKeys(t *testing.T) {
 	}
 
 	// down moves cursor
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	m = next.(Model)
 	if m.suggCursor != 1 {
 		t.Errorf("expected cursor=1 after down, got %d", m.suggCursor)
 	}
 
 	// up moves it back
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	next, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	m = next.(Model)
 	if m.suggCursor != 0 {
 		t.Errorf("expected cursor=0 after up, got %d", m.suggCursor)
@@ -391,7 +391,7 @@ func TestSuggestions_NavWithArrowKeys(t *testing.T) {
 
 func TestSuggestions_UpDoesNotGoNegative(t *testing.T) {
 	m := typeInto(newTestModel(), "/")
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	m = next.(Model)
 	if m.suggCursor < 0 {
 		t.Errorf("cursor went negative: %d", m.suggCursor)
@@ -402,7 +402,7 @@ func TestSuggestions_DownDoesNotExceedLength(t *testing.T) {
 	m := typeInto(newTestModel(), "/")
 	total := len(m.suggestions)
 	for i := 0; i < total+5; i++ {
-		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 		m = next.(Model)
 	}
 	if m.suggCursor >= total {
@@ -415,7 +415,7 @@ func TestSuggestions_EscClears(t *testing.T) {
 	if len(m.suggestions) == 0 {
 		t.Fatal("need suggestions before testing esc")
 	}
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	m = next.(Model)
 	if len(m.suggestions) != 0 {
 		t.Errorf("expected suggestions cleared after esc, got %d", len(m.suggestions))
@@ -424,7 +424,7 @@ func TestSuggestions_EscClears(t *testing.T) {
 
 func TestSuggestions_TabFillsCommand(t *testing.T) {
 	m := typeInto(newTestModel(), "/mo")
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab})
 	m = next.(Model)
 	val := m.input.Value()
 	// /model takes args so should have a trailing space
@@ -438,7 +438,7 @@ func TestSuggestions_TabFillsCommand(t *testing.T) {
 
 func TestSuggestions_EnterFillsCommandNotSubmit(t *testing.T) {
 	m := typeInto(newTestModel(), "/mo")
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	m = next.(Model)
 	val := m.input.Value()
 	if val != "/model " {
@@ -529,7 +529,7 @@ func TestHandleCommand_SkillNotFound(t *testing.T) {
 
 func TestView_ChatModeContainsInput(t *testing.T) {
 	m := newTestModel()
-	view := m.View()
+	view := m.View().Content
 	if !strings.Contains(view, "pigeon") {
 		t.Errorf("expected header in view")
 	}

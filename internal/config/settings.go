@@ -45,10 +45,16 @@ type PermissionConfig struct {
 	//   "sudo *"  — deny all sudo usage
 	//   "git push" — deny exactly "git push" (and "git push <anything>")
 	BashDenyPatterns []string `json:"bash_deny_patterns"`
+	// SandboxMode restricts write/edit operations to the current working
+	// directory and pigeon configuration directories (~/.config/pigeon/,
+	// ~/.pigeon/, .pigeon/).  Operations targeting paths outside the sandbox
+	// always require interactive approval, even if the tool is in
+	// allowed_tools.  Bash commands are not affected by sandbox mode.
+	SandboxMode bool `json:"sandbox_mode"`
 }
 
 // Keybindings holds the key sequences for pigeon's chat shortcuts.
-// Values must be BubbleTea key strings (e.g. "ctrl+c", "alt+esc").
+// Values must be BubbleTea key strings (e.g. "ctrl+q", "ctrl+w").
 type Keybindings struct {
 	// ClearInput clears the text-input field when it is non-empty.
 	ClearInput string `json:"clear_input"`
@@ -67,13 +73,13 @@ type Keybindings struct {
 func defaults() Settings {
 	return Settings{
 		CollapseThinking:    false,
-		CollapseToolResults: true,
+		CollapseToolResults: false,
 		Keybindings: Keybindings{
-			ClearInput:     "alt+c",
-			Quit:           "alt+q",
-			CancelTurn:     "alt+esc",
-			ToggleThinking: "alt+t",
-			ToggleTools:    "alt+r",
+			ClearInput:     "ctrl+w",
+			Quit:           "ctrl+q",
+			CancelTurn:     "ctrl+x",
+			ToggleThinking: "ctrl+t",
+			ToggleTools:    "ctrl+r",
 		},
 	}
 }

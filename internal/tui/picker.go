@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"pigeon/internal/provider/openrouter"
 )
@@ -43,6 +43,8 @@ type picker struct {
 	// favModels is the resolved subset of all — populated once models load.
 	favIDs    []string
 	favModels []openrouter.ModelInfo
+	// currentModel is the model ID currently in use (shown at top, highlighted).
+	currentModel string
 	// cursor is a unified index across both sections:
 	//   0 .. len(favModels)-1          → favorites section
 	//   len(favModels) .. total-1      → main filtered list
@@ -54,24 +56,29 @@ type picker struct {
 	height  int
 }
 
-func newPicker(width, height int, favorites []string) picker {
+func newPicker(width, height int, favorites []string, currentModel string) picker {
 	ti := textinput.New()
 	ti.Placeholder = "Search models…"
 	ti.Focus()
 	ti.CharLimit = 0
-	ti.Width = max(20, width-6)
-	ti.PromptStyle = pickerPromptStyle
-	ti.TextStyle = pickerInputTextStyle
+	ti.SetWidth(max(20, width-6))
+	{
+		s := ti.Styles()
+		s.Focused.Prompt = pickerPromptStyle
+		s.Focused.Text = pickerInputTextStyle
+		ti.SetStyles(s)
+	}
 
 	favs := make([]string, len(favorites))
 	copy(favs, favorites)
 
 	return picker{
-		input:   ti,
-		loading: true,
-		width:   width,
-		height:  height,
-		favIDs:  favs,
+		input:        ti,
+		loading:      true,
+		width:        width,
+		height:       height,
+		favIDs:       favs,
+		currentModel: currentModel,
 	}
 }
 
@@ -123,7 +130,7 @@ func (p picker) Update(msg tea.Msg) (picker, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		p.width = msg.Width
 		p.height = msg.Height
-		p.input.Width = max(20, msg.Width-6)
+		p.input.SetWidth(max(20, msg.Width-6))
 		return p, nil
 
 	case modelLoadedMsg:
@@ -132,7 +139,8 @@ func (p picker) Update(msg tea.Msg) (picker, tea.Cmd) {
 		p.all = msg.models
 		p.filtered = filterModels(p.all, "")
 		p.favModels = resolveFavModels(p.favIDs, p.all)
-		p.cursor = 0
+		sortCurrentModelToTop(p.filtered, p.currentModel)
+		p.cursor = cursorForCurrentModel(p.filtered, p.favModels, p.currentModel)
 		p.offset = 0
 		return p, textinput.Blink
 
@@ -141,7 +149,7 @@ func (p picker) Update(msg tea.Msg) (picker, tea.Cmd) {
 		p.err = msg.err
 		return p, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			return p, func() tea.Msg { return modelPickCanceledMsg{} }
@@ -191,7 +199,8 @@ func (p picker) Update(msg tea.Msg) (picker, tea.Cmd) {
 		p.input, cmd = p.input.Update(msg)
 		if p.input.Value() != prev {
 			p.filtered = filterModels(p.all, p.input.Value())
-			p.cursor = 0
+			sortCurrentModelToTop(p.filtered, p.currentModel)
+			p.cursor = cursorForCurrentModel(p.filtered, p.favModels, p.currentModel)
 			p.offset = 0
 		}
 		return p, cmd
@@ -317,19 +326,24 @@ func (p picker) writeModelRow(b *strings.Builder, m openrouter.ModelInfo, select
 		starMark = pickerFavStarStyle.Render("★ ")
 	}
 
+	// Current model indicator (shown when this model is the active one).
+	currentMark := ""
+	if m.ID == p.currentModel {
+		currentMark = pickerCurrentStyle.Render("●")
+	}
+
 	if selected {
 		cursor := pickerCursorStyle.Render("▶ ")
-		row := pickerSelectedStyle.Render(
-			fmt.Sprintf("%-*s  %-*s  %-11s  %-8s", nameW, name, idW, id, providerBadge, ctxStr),
-		)
-		b.WriteString(cursor + row + "\n")
+		label := fmt.Sprintf("%-*s  %-*s  %-11s  %-8s", nameW, name, idW, id, providerBadge, ctxStr)
+		row := pickerSelectedStyle.Render(label)
+		b.WriteString(cursor + row + " " + currentMark + "\n")
 	} else {
 		cursor := "  "
 		nameStr := pickerNormalStyle.Render(fmt.Sprintf("%-*s", nameW, name))
 		idStr := pickerDimStyle.Render(fmt.Sprintf("  %-*s", idW, id))
 		provStr := pickerProviderStyle.Render(fmt.Sprintf("  %-11s", providerBadge))
 		ctxS := pickerDimStyle.Render(fmt.Sprintf("  %-8s", ctxStr))
-		b.WriteString(cursor + starMark + nameStr + idStr + provStr + ctxS + "\n")
+		b.WriteString(cursor + starMark + nameStr + idStr + provStr + ctxS + " " + currentMark + "\n")
 	}
 }
 
@@ -370,6 +384,48 @@ func removeFav(ids []string, id string) []string {
 	return out
 }
 
+// ── current model helpers ──────────────────────────────────────────────────────
+
+// sortCurrentModelToTop reorders filtered in-place so that the model with the
+// given ID appears first. If the ID is empty or not found, the list is unchanged.
+func sortCurrentModelToTop(filtered []openrouter.ModelInfo, currentModel string) {
+	if currentModel == "" {
+		return
+	}
+	for i, m := range filtered {
+		if m.ID == currentModel {
+			if i == 0 {
+				return
+			}
+			// Shift elements down and place current model at front.
+			copy(filtered[1:i+1], filtered[:i])
+			filtered[0] = m
+			return
+		}
+	}
+}
+
+// cursorForCurrentModel returns the unified cursor position that highlights the
+// current model. If the current model is already a favorite, the cursor points
+// to it in the favorites section. Otherwise it points to position 0 in the
+// main list (where sortCurrentModelToTop placed it).
+func cursorForCurrentModel(filtered []openrouter.ModelInfo, favModels []openrouter.ModelInfo, currentModel string) int {
+	if currentModel == "" {
+		return 0
+	}
+	// Check favorites section first.
+	for i, m := range favModels {
+		if m.ID == currentModel {
+			return i
+		}
+	}
+	// Current model should be at index 0 in the main list after sorting.
+	if len(filtered) > 0 && filtered[0].ID == currentModel {
+		return len(favModels)
+	}
+	return 0
+}
+
 // ── filter ────────────────────────────────────────────────────────────────────
 
 func filterModels(models []openrouter.ModelInfo, query string) []openrouter.ModelInfo {
@@ -404,6 +460,7 @@ var (
 	pickerProviderStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 	pickerFavHeaderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true)
 	pickerFavStarStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	pickerCurrentStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────

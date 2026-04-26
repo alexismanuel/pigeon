@@ -9,7 +9,6 @@ import (
 	"pigeon/internal/tools"
 )
 
-const maxToolRounds = 12
 
 type StreamingClient interface {
 	StreamChatCompletion(
@@ -44,6 +43,10 @@ type TurnCallbacks struct {
 	OnToken        func(string)
 	OnThinkingToken func(string) // reasoning/thinking tokens from models that expose them
 	OnToolEvent    func(ToolEvent)
+	// OnAssistantMessage is called once per LLM round with the complete
+	// assistant message (including all tool calls), before any tool
+	// execution begins. Used for incremental session persistence.
+	OnAssistantMessage func(openrouter.Message)
 	// BeforeToolCall fires synchronously before each tool execution.
 	// Returning true blocks the call; the agent substitutes a canned
 	// "blocked by extension" result so the model can continue cleanly.
@@ -88,6 +91,9 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 	if cb.OnToolEvent == nil {
 		cb.OnToolEvent = func(ToolEvent) {}
 	}
+	if cb.OnAssistantMessage == nil {
+		cb.OnAssistantMessage = func(openrouter.Message) {}
+	}
 	if cb.BeforeToolCall == nil {
 		cb.BeforeToolCall = func(string, string) bool { return false }
 	}
@@ -100,9 +106,11 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 	newMessages := []openrouter.Message{{Role: "user", Content: userInput}}
 	toolDefs := a.tools.Definitions()
 
-	for round := 0; round < maxToolRounds; round++ {
+	for {
+		var reasoningBuf strings.Builder
 		assistantMsg, err := a.client.StreamChatCompletion(ctx, model, messages, toolDefs, func(event openrouter.StreamEvent) {
 			if event.Delta.Reasoning != "" {
+				reasoningBuf.WriteString(event.Delta.Reasoning)
 				cb.OnThinkingToken(event.Delta.Reasoning)
 			}
 			if event.Delta.Content != "" {
@@ -113,6 +121,15 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 			return nil, err
 		}
 		cb.OnUsage(assistantMsg.Usage)
+
+		// Capture accumulated reasoning tokens into the message so they
+		// are persisted alongside the assistant content in the session.
+		assistantMsg.ReasoningContent = reasoningBuf.String()
+		assistantMsg.StopReason = "complete"
+
+		// Notify the caller with the complete assistant message before
+		// any tool execution. This enables per-message persistence.
+		cb.OnAssistantMessage(assistantMsg)
 
 		messages = append(messages, assistantMsg)
 		newMessages = append(newMessages, assistantMsg)
@@ -167,5 +184,5 @@ func (a *Agent) RunTurn(ctx context.Context, model string, history []openrouter.
 		}
 	}
 
-	return nil, fmt.Errorf("tool loop exceeded maximum rounds (%d)", maxToolRounds)
+	return nil, fmt.Errorf("tool loop terminated unexpectedly")
 }

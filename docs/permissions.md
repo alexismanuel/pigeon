@@ -90,17 +90,55 @@ With no `"permissions"` section the system uses these defaults:
 
 * `skip_requests`: `false` — every bash, write, and edit call prompts
 * `allowed_tools`: `[]` — nothing is auto-approved
+* `sandbox_mode`: `false` — no sandbox restrictions
+
+### Sandbox mode
+
+When `"sandbox_mode": true` is set, **write** and **edit** operations targeting
+paths **outside** the current working directory (and pigeon configuration
+directories) always require interactive approval — even if the tool is listed in
+`allowed_tools`.  Bash commands are not affected by sandbox mode.
+
+The sandbox boundary includes:
+
+| Directory | Purpose |
+|-----------|---------|
+| Current working directory | Your project files |
+| `~/.config/pigeon/` | User-global pigeon config (skills, prompts, extensions) |
+| `~/.pigeon/` | Session storage |
+| `.pigeon/` | Project-local config |
+
+```json
+{
+  "permissions": {
+    "allowed_tools": ["bash", "write", "edit"],
+    "sandbox_mode": true
+  }
+}
+```
+
+With this configuration:
+- Writing or editing files **inside** your project dir → auto-approved
+- Writing or editing files **inside** `~/.config/pigeon/` → auto-approved
+- Writing or editing files **outside** the sandbox (e.g. `/etc/hosts`) → prompts
+  every time
+- Bash commands → auto-approved (not affected by sandbox)
+
+You can still approve an out-of-sandbox request persistently (press `s`) to
+cache the approval for the rest of the session.
 
 ## Permission levels (in order of precedence)
 
 1. **skip mode** — all requests auto-approved when `skip_requests: true`
-2. **allowlist** — request auto-approved if its tool/action matches an entry in
+2. **sandbox boundary** — out-of-sandbox write/edit always prompts (when
+   `sandbox_mode: true`), bypassing the allowlist
+3. **allowlist** — request auto-approved if its tool/action matches an entry in
    `allowed_tools`
-3. **session auto-approve** — all requests in this session auto-approved
+4. **session auto-approve** — all requests in this session auto-approved
    (set programmatically via `permission.AutoApproveSession`)
-4. **session cache** — this exact tool + action + path was previously granted
+5. **session cache** — this exact tool + action + path was previously granted
    persistently (via `[s]` in the dialog)
-5. **interactive prompt** — show the dialog and wait for user input
+6. **interactive prompt** — show the dialog and wait for user input
 
 ## Protected tools
 

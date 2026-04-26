@@ -5,9 +5,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 const authFile = "auth.json"
+
+// Credentials holds an OAuth access + refresh token pair.
+type Credentials struct {
+	Access  string `json:"access"`
+	Refresh string `json:"refresh"`
+	// Expires is Unix milliseconds at which the access token becomes invalid.
+	Expires int64 `json:"expires"`
+}
+
+// IsExpired returns true when the access token is expired or about to expire.
+func (c Credentials) IsExpired() bool {
+	return c.Expires != 0 && time.Now().UnixMilli() >= c.Expires
+}
 
 // ProviderAuth holds credentials for a single provider.
 type ProviderAuth struct {
@@ -66,61 +80,30 @@ func Save(d AuthData) error {
 	return nil
 }
 
-// GetAnthropicToken returns the current Anthropic access token, refreshing it
-// if expired. It persists the updated credentials on refresh.
-// Returns ("", nil) if no Anthropic credentials are stored.
-func GetAnthropicToken() (string, error) {
+// GetZaiAPIKey returns the stored Zai API key.
+// Returns ("", nil) if no Zai credentials are stored.
+func GetZaiAPIKey() (string, error) {
 	d, err := Load()
 	if err != nil {
 		return "", err
 	}
-	pa, ok := d.Providers["anthropic"]
+	pa, ok := d.Providers["zai"]
 	if !ok {
 		return "", nil
 	}
-	switch pa.Type {
-	case "api_key":
+	if pa.Type == "api_key" {
 		return pa.Key, nil
-	case "oauth":
-		if pa.OAuth == nil {
-			return "", nil
-		}
-		if !pa.OAuth.IsExpired() {
-			return pa.OAuth.Access, nil
-		}
-		// Refresh the token.
-		fresh, err := Refresh(pa.OAuth.Refresh)
-		if err != nil {
-			return "", fmt.Errorf("refresh anthropic token: %w", err)
-		}
-		pa.OAuth = &fresh
-		d.Providers["anthropic"] = pa
-		if saveErr := Save(d); saveErr != nil {
-			// Non-fatal — return the fresh token anyway.
-			_ = saveErr
-		}
-		return fresh.Access, nil
 	}
 	return "", nil
 }
 
-// SetAnthropicAPIKey stores a plain API key for Anthropic.
-func SetAnthropicAPIKey(key string) error {
+// SetZaiAPIKey stores a plain API key for Zai.
+func SetZaiAPIKey(key string) error {
 	d, err := Load()
 	if err != nil {
 		return err
 	}
-	d.Providers["anthropic"] = ProviderAuth{Type: "api_key", Key: key}
-	return Save(d)
-}
-
-// SetAnthropicOAuth stores OAuth credentials for Anthropic.
-func SetAnthropicOAuth(creds Credentials) error {
-	d, err := Load()
-	if err != nil {
-		return err
-	}
-	d.Providers["anthropic"] = ProviderAuth{Type: "oauth", OAuth: &creds}
+	d.Providers["zai"] = ProviderAuth{Type: "api_key", Key: key}
 	return Save(d)
 }
 
@@ -134,7 +117,13 @@ func RemoveProvider(provider string) error {
 	return Save(d)
 }
 
-func authPath() (string, error) {
+// authPathFn returns the path to auth.json. It is a variable so tests can
+// override it to use a temp directory.
+var authPathFn = defaultAuthPath
+
+func authPath() (string, error) { return authPathFn() }
+
+func defaultAuthPath() (string, error) {
 	home, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("config dir: %w", err)

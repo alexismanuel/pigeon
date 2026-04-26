@@ -10,7 +10,8 @@ type commandDef struct {
 
 // builtinCommands are always present regardless of loaded resources.
 var builtinCommands = []commandDef{
-	{"/login", "", "log in to a provider (OAuth — Claude Pro/Max subscription)"},
+	{"/login", "", "log in to a provider (Anthropic, Zai, etc.)"},
+	{"/logout", "[provider]", "log out — remove stored credentials (e.g. /logout zai)"},
 	{"/model", "[id]", "switch model — interactive picker if no id given"},
 	{"/new", "", "start a new session"},
 	{"/sessions", "", "browse and resume a previous session"},

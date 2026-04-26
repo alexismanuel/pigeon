@@ -10,7 +10,7 @@ import (
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func newTestService() *permissionService {
-	return NewService("/tmp", false, []string{}, nil).(*permissionService)
+	return NewService("/tmp", false, []string{}, nil, false).(*permissionService)
 }
 
 func basicReq(session, tool, action string) CreatePermissionRequest {
@@ -36,7 +36,7 @@ func respondAsync(s Service, respond func(id string)) {
 // ── skip mode ─────────────────────────────────────────────────────────────────
 
 func TestSkipMode_AutoApprovesAll(t *testing.T) {
-	s := NewService("/tmp", true, nil, nil)
+	s := NewService("/tmp", true, nil, nil, false)
 	ok, err := s.Request(context.Background(), basicReq("s1", "bash", "execute"))
 	if !ok || err != nil {
 		t.Fatalf("skip mode should auto-approve: ok=%v err=%v", ok, err)
@@ -46,7 +46,7 @@ func TestSkipMode_AutoApprovesAll(t *testing.T) {
 // ── allowlist ─────────────────────────────────────────────────────────────────
 
 func TestAllowlist_ToolName(t *testing.T) {
-	s := NewService("/tmp", false, []string{"bash", "read"}, nil)
+	s := NewService("/tmp", false, []string{"bash", "read"}, nil, false)
 	ok, err := s.Request(context.Background(), basicReq("s1", "bash", "execute"))
 	if !ok || err != nil {
 		t.Fatalf("allowlisted tool should be auto-approved: ok=%v err=%v", ok, err)
@@ -54,7 +54,7 @@ func TestAllowlist_ToolName(t *testing.T) {
 }
 
 func TestAllowlist_ToolNameAction(t *testing.T) {
-	s := NewService("/tmp", false, []string{"bash:execute"}, nil)
+	s := NewService("/tmp", false, []string{"bash:execute"}, nil, false)
 	ok, err := s.Request(context.Background(), basicReq("s1", "bash", "execute"))
 	if !ok || err != nil {
 		t.Fatalf("allowlisted tool:action should be auto-approved: ok=%v err=%v", ok, err)
@@ -62,7 +62,7 @@ func TestAllowlist_ToolNameAction(t *testing.T) {
 }
 
 func TestAllowlist_MismatchedAction(t *testing.T) {
-	s := NewService("/tmp", false, []string{"bash:read"}, nil)
+	s := NewService("/tmp", false, []string{"bash:read"}, nil, false)
 	// "bash:execute" is NOT in the allowlist.
 	respondAsync(s, func(id string) { s.Deny(id) })
 	ok, err := s.Request(context.Background(), basicReq("s1", "bash", "execute"))
@@ -75,7 +75,7 @@ func TestAllowlist_MismatchedAction(t *testing.T) {
 }
 
 func TestAllowlist_EmptyAllowlist(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 	respondAsync(s, func(id string) { s.Grant(id) })
 	ok, err := s.Request(context.Background(), basicReq("s1", "bash", "execute"))
 	if !ok || err != nil {
@@ -86,7 +86,7 @@ func TestAllowlist_EmptyAllowlist(t *testing.T) {
 // ── grant / deny ──────────────────────────────────────────────────────────────
 
 func TestGrant_OneTime(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 	respondAsync(s, func(id string) { s.Grant(id) })
 	ok, err := s.Request(context.Background(), basicReq("s1", "bash", "execute"))
 	if !ok || err != nil {
@@ -95,7 +95,7 @@ func TestGrant_OneTime(t *testing.T) {
 }
 
 func TestDeny_ReturnsFalseAndErrDenied(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 	respondAsync(s, func(id string) { s.Deny(id) })
 	ok, err := s.Request(context.Background(), basicReq("s1", "bash", "execute"))
 	if ok {
@@ -109,7 +109,7 @@ func TestDeny_ReturnsFalseAndErrDenied(t *testing.T) {
 // ── persistent grants ─────────────────────────────────────────────────────────
 
 func TestGrantPersistent_CachesForSession(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 
 	// First request: user grants persistently.
 	var wg sync.WaitGroup
@@ -133,7 +133,7 @@ func TestGrantPersistent_CachesForSession(t *testing.T) {
 }
 
 func TestGrantPersistent_DifferentSessionNotCached(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -154,7 +154,7 @@ func TestGrantPersistent_DifferentSessionNotCached(t *testing.T) {
 }
 
 func TestGrantPersistent_DifferentActionNotCached(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -177,7 +177,7 @@ func TestGrantPersistent_DifferentActionNotCached(t *testing.T) {
 // ── session auto-approval ─────────────────────────────────────────────────────
 
 func TestAutoApproveSession_SkipsAllPrompts(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 	s.AutoApproveSession("trusted-session")
 
 	ok, err := s.Request(context.Background(), basicReq("trusted-session", "bash", "execute"))
@@ -191,7 +191,7 @@ func TestAutoApproveSession_SkipsAllPrompts(t *testing.T) {
 }
 
 func TestAutoApproveSession_DoesNotAffectOtherSessions(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 	s.AutoApproveSession("trusted")
 
 	respondAsync(s, func(id string) { s.Deny(id) })
@@ -204,7 +204,7 @@ func TestAutoApproveSession_DoesNotAffectOtherSessions(t *testing.T) {
 // ── context cancellation ──────────────────────────────────────────────────────
 
 func TestRequest_ContextCancelledWhileWaiting(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -244,7 +244,7 @@ func TestSessionIDFromContext_MissingKey(t *testing.T) {
 // ── bash deny patterns ────────────────────────────────────────────────────────
 
 func TestBashDenyPatterns_SpaceStar(t *testing.T) {
-	s := NewService("/tmp", false, nil, []string{"rm *", "chown *"})
+	s := NewService("/tmp", false, nil, []string{"rm *", "chown *"}, false)
 	ok, err := s.Request(context.Background(), CreatePermissionRequest{
 		SessionID: "s1", ToolName: "bash", Action: "execute",
 		Path:   "/tmp",
@@ -259,7 +259,7 @@ func TestBashDenyPatterns_SpaceStar(t *testing.T) {
 }
 
 func TestBashDenyPatterns_ExactPrefix(t *testing.T) {
-	s := NewService("/tmp", false, nil, []string{"git push"})
+	s := NewService("/tmp", false, nil, []string{"git push"}, false)
 	ok, _ := s.Request(context.Background(), CreatePermissionRequest{
 		SessionID: "s1", ToolName: "bash", Action: "execute",
 		Path:   "/tmp",
@@ -271,7 +271,7 @@ func TestBashDenyPatterns_ExactPrefix(t *testing.T) {
 }
 
 func TestBashDenyPatterns_ExactMatch(t *testing.T) {
-	s := NewService("/tmp", false, nil, []string{"git push"})
+	s := NewService("/tmp", false, nil, []string{"git push"}, false)
 	ok, _ := s.Request(context.Background(), CreatePermissionRequest{
 		SessionID: "s1", ToolName: "bash", Action: "execute",
 		Path:   "/tmp",
@@ -283,7 +283,7 @@ func TestBashDenyPatterns_ExactMatch(t *testing.T) {
 }
 
 func TestBashDenyPatterns_NonMatchingCommandPrompts(t *testing.T) {
-	s := NewService("/tmp", false, nil, []string{"rm *"})
+	s := NewService("/tmp", false, nil, []string{"rm *"}, false)
 	respondAsync(s, func(id string) { s.Grant(id) })
 	ok, err := s.Request(context.Background(), CreatePermissionRequest{
 		SessionID: "s1", ToolName: "bash", Action: "execute",
@@ -297,7 +297,7 @@ func TestBashDenyPatterns_NonMatchingCommandPrompts(t *testing.T) {
 
 func TestBashDenyPatterns_NoBashParamsSkipsCheck(t *testing.T) {
 	// If the tool is bash but Params is not BashParams, the pattern check is skipped.
-	s := NewService("/tmp", false, nil, []string{"rm *"})
+	s := NewService("/tmp", false, nil, []string{"rm *"}, false)
 	respondAsync(s, func(id string) { s.Grant(id) })
 	ok, err := s.Request(context.Background(), CreatePermissionRequest{
 		SessionID: "s1", ToolName: "bash", Action: "execute",
@@ -311,7 +311,7 @@ func TestBashDenyPatterns_NoBashParamsSkipsCheck(t *testing.T) {
 
 func TestBashDenyPatterns_DenyBeforeAllowlist(t *testing.T) {
 	// Deny wins even when the tool is in the allowlist.
-	s := NewService("/tmp", false, []string{"bash"}, []string{"rm *"})
+	s := NewService("/tmp", false, []string{"bash"}, []string{"rm *"}, false)
 	ok, _ := s.Request(context.Background(), CreatePermissionRequest{
 		SessionID: "s1", ToolName: "bash", Action: "execute",
 		Path:   "/tmp",
@@ -392,7 +392,7 @@ func TestResolveDir_NonexistentFile(t *testing.T) {
 // ── sequential requests ───────────────────────────────────────────────────────
 
 func TestSequentialRequests_GrantThenDeny(t *testing.T) {
-	s := NewService("/tmp", false, nil, nil)
+	s := NewService("/tmp", false, nil, nil, false)
 
 	// First: grant
 	respondAsync(s, func(id string) { s.Grant(id) })
@@ -409,5 +409,177 @@ func TestSequentialRequests_GrantThenDeny(t *testing.T) {
 	}
 	if !errors.Is(err2, ErrDenied) {
 		t.Fatalf("expected ErrDenied, got %v", err2)
+	}
+}
+
+// ── sandbox mode ────────────────────────────────────────────────────────────
+
+func TestSandboxMode_WithinWorkingDir_AllowedByAllowlist(t *testing.T) {
+	// Even with sandbox mode, paths inside the working dir are auto-approved
+	// when the tool is in the allowlist.
+	s := NewService("/tmp", false, []string{"write"}, nil, true)
+	ok, err := s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "write", Action: "create",
+		Path: "/tmp/subdir/file.txt",
+	})
+	if !ok || err != nil {
+		t.Fatalf("write inside working dir should be auto-approved: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSandboxMode_OutsideWorkingDir_PromptsEvenWithAllowlist(t *testing.T) {
+	// With sandbox mode on, writing outside working dir must prompt,
+	// even if "write" is in the allowlist.
+	s := NewService("/tmp", false, []string{"write"}, nil, true)
+	respondAsync(s, func(id string) { s.Grant(id) })
+	ok, err := s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "write", Action: "create",
+		Path: "/var/log/app.log",
+	})
+	if !ok || err != nil {
+		t.Fatalf("outside-sandbox write should prompt and be granted: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSandboxMode_OutsideWorkingDir_Denied(t *testing.T) {
+	s := NewService("/tmp", false, []string{"write"}, nil, true)
+	respondAsync(s, func(id string) { s.Deny(id) })
+	ok, err := s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "write", Action: "create",
+		Path: "/var/log/app.log",
+	})
+	if ok {
+		t.Fatal("denied out-of-sandbox write should return false")
+	}
+	if !errors.Is(err, ErrDenied) {
+		t.Fatalf("expected ErrDenied, got %v", err)
+	}
+}
+
+func TestSandboxMode_EditOutsideSandbox_Prompts(t *testing.T) {
+	s := NewService("/tmp", false, []string{"edit"}, nil, true)
+	respondAsync(s, func(id string) { s.Deny(id) })
+	ok, _ := s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "edit", Action: "modify",
+		Path: "/etc/hosts",
+	})
+	if ok {
+		t.Fatal("edit outside sandbox should not be auto-approved")
+	}
+}
+
+func TestSandboxMode_EditInsideSandbox_AutoApproved(t *testing.T) {
+	s := NewService("/tmp", false, []string{"edit"}, nil, true)
+	ok, err := s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "edit", Action: "modify",
+		Path: "/tmp/myfile.go",
+	})
+	if !ok || err != nil {
+		t.Fatalf("edit inside sandbox should be auto-approved: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSandboxMode_BashNotAffected(t *testing.T) {
+	// Bash commands are not sandboxed — they always respect the allowlist.
+	s := NewService("/tmp", false, []string{"bash"}, nil, true)
+	ok, err := s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "bash", Action: "execute",
+		Path:   "/tmp",
+		Params: BashParams{Command: "cat /etc/passwd"},
+	})
+	if !ok || err != nil {
+		t.Fatalf("bash should not be sandboxed: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSandboxMode_SandboxOff_AllowlistWorksEverywhere(t *testing.T) {
+	// Without sandbox mode, the allowlist works for all paths.
+	s := NewService("/tmp", false, []string{"write"}, nil, false)
+	ok, err := s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "write", Action: "create",
+		Path: "/var/log/app.log",
+	})
+	if !ok || err != nil {
+		t.Fatalf("without sandbox, allowlist should work everywhere: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSandboxMode_PersistentGrantOutOfSandbox(t *testing.T) {
+	// Granting persistently for an out-of-sandbox path should cache it.
+	s := NewService("/tmp", false, []string{"write"}, nil, true)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := <-s.Subscribe()
+		s.GrantPersistent(req.ID)
+	}()
+	ok, err := s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "write", Action: "create",
+		Path: "/var/log/app.log",
+	})
+	wg.Wait()
+	if !ok || err != nil {
+		t.Fatalf("first out-of-sandbox request should be granted: ok=%v err=%v", ok, err)
+	}
+
+	// Second identical request should be auto-approved via cache.
+	ok, err = s.Request(context.Background(), CreatePermissionRequest{
+		SessionID: "s1", ToolName: "write", Action: "create",
+		Path: "/var/log/app.log",
+	})
+	if !ok || err != nil {
+		t.Fatalf("cached out-of-sandbox request should be auto-approved: ok=%v err=%v", ok, err)
+	}
+}
+
+// ── isWithinSandbox ─────────────────────────────────────────────────────────
+
+func TestIsWithinSandbox(t *testing.T) {
+	dirs := []string{"/tmp", "/home/user/.config/pigeon", "/home/user/.pigeon"}
+
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/tmp", true},
+		{"/tmp/", true},
+		{"/tmp/subdir/file.txt", true},
+		{"/var/log", false},
+		{"/home/user/.config/pigeon/settings.json", true},
+		{"/home/user/.config/pigeon/extensions/hello.lua", true},
+		{"/home/user/.pigeon/sessions/2024-01-01-abcd.jsonl", true},
+		{"/home/user/.config", false},
+		{"/home/user/.pigeonz", false},
+		{"/tmpfile", false},
+	}
+
+	for _, tt := range tests {
+		got := isWithinSandbox(tt.path, dirs)
+		if got != tt.want {
+			t.Errorf("isWithinSandbox(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestComputeSandboxDirs(t *testing.T) {
+	dirs := computeSandboxDirs("/tmp")
+	if len(dirs) < 3 {
+		t.Fatalf("expected at least 3 sandbox dirs, got %d: %v", len(dirs), dirs)
+	}
+	// First should always be the working dir.
+	if dirs[0] != "/tmp" {
+		t.Errorf("first sandbox dir should be working dir, got %q", dirs[0])
+	}
+	// Should contain .pigeon under working dir.
+	found := false
+	for _, d := range dirs {
+		if d == "/tmp/.pigeon" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("sandbox dirs should include /tmp/.pigeon")
 	}
 }

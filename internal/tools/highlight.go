@@ -7,7 +7,7 @@ import (
 	"github.com/alecthomas/chroma/v2/formatters"
 	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/alecthomas/chroma/v2/styles"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 var (
@@ -48,10 +48,10 @@ func renderReadDisplay(path string, lines []string, startLine int) string {
 	hlLines := strings.Split(hlText, "\n")
 
 	// ── gutter metrics ────────────────────────────────────────────────────────
+	// No minimum width: the gutter is just wide enough for the largest line
+	// number.  The bToolResult renderer adds its own PaddingLeft so that read
+	// output aligns with other tool results.
 	width := len(fmt.Sprintf("%d", startLine+len(lines)-1))
-	if width < 4 {
-		width = 4
-	}
 	sep := gutterSepStyle.Render("│")
 
 	// ── assemble output ───────────────────────────────────────────────────────
@@ -66,4 +66,21 @@ func renderReadDisplay(path string, lines []string, startLine int) string {
 		b.WriteString(lineNum + sep + code + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderWriteDisplay returns an ANSI-colourised preview of the content written
+// by the write tool, reusing the same gutter + syntax-highlighting as read.
+func renderWriteDisplay(path, content string) string {
+	if content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	// Remove trailing empty line from trailing newline.
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return renderReadDisplay(path, lines, 1)
 }

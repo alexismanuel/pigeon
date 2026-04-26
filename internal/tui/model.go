@@ -6,18 +6,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/color"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/glamour"
-	"github.com/charmbracelet/lipgloss"
+	rw "github.com/mattn/go-runewidth"
+
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/glamour/v2"
+	"charm.land/lipgloss/v2"
 
 	"pigeon/internal/agent"
 	"pigeon/internal/config"
@@ -123,6 +127,14 @@ type toolCallMsg struct {
 	args string
 }
 
+// assistantRoundMsg carries the full assistant message (with all tool calls)
+// for a single LLM round. Sent once before individual toolCallMsg events.
+// Used for per-message persistence: the TUI persists the assistant message
+// immediately rather than waiting for turnDoneMsg.
+type assistantRoundMsg struct {
+	message openrouter.Message
+}
+
 type toolResultMsg struct {
 	name    string
 	result  string
@@ -167,7 +179,7 @@ type Model struct {
 	modelName     string
 	systemPrompt  string // injected as first message each turn; "" = none
 
-	input      textinput.Model
+	input      textarea.Model
 	vp         viewport.Model
 	autoScroll bool // scroll to bottom whenever new content arrives
 
@@ -199,13 +211,14 @@ type Model struct {
 	permService permission.Service   // nil when permissions are disabled
 	currentPerm *permission.Request  // non-nil while a permission dialog is active
 
-	// login flow (loginSelectMode / loginAuthMode)
+	// login flow (loginSelectMode / loginAuthMode / loginApiKeyMode)
 	loginProviders []loginProvider      // providers shown in the selector
 	loginSelectIdx int                  // currently highlighted index
 	loginLines     []string             // progress lines shown in auth dialog
 	loginCh        chan loginEventMsg    // receives events from the OAuth goroutine
 	loginCancel    context.CancelFunc   // cancels the OAuth goroutine
-	// onProviderLogin is called after a successful OAuth login so callers can
+	loginInput     textinput.Model      // API key input for providers that use key-based auth
+	// onProviderLogin is called after a successful login so callers can
 	// hot-add the new provider without restarting. May be nil.
 	onProviderLogin func(providerID string)
 
@@ -223,9 +236,10 @@ type Model struct {
 	statusCh <-chan luaext.StatusUpdate
 	statuses map[string]string // id → text, from extension set_status calls
 
-	// Token usage tracking — accumulated across all API calls in this session.
-	sessionInputTokens  int
-	sessionOutputTokens int
+	// Token usage tracking.
+	sessionInputTokens  int // cumulative input tokens across all API calls (for cost tracking)
+	sessionOutputTokens int // cumulative output tokens across all API calls (for cost tracking)
+	lastInputTokens     int // input tokens from the most recent API call (= current context size)
 	// modelContextLengths maps model ID → context window size (tokens).
 	// Populated when the model catalog is first fetched.
 	modelContextLengths map[string]int
@@ -311,14 +325,30 @@ type permRequestMsg struct {
 }
 
 func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions sessionStore, sessionID string, reg *resources.Registry, rt *luaext.Runtime, statusCh <-chan luaext.StatusUpdate, settings config.Settings, perm permission.Service, onProviderLogin func(providerID string), systemPrompt ...string) Model {
-	in := textinput.New()
+	in := textarea.New()
 	in.Placeholder = "Ask pigeon..."
-	in.Prompt = "> " // replaced by syncPrompt() below
-	in.Focus()
+	in.Prompt = "" // replaced by syncPrompt() below
 	in.CharLimit = 0
-	in.Width = 100
+	in.ShowLineNumbers = false
+	in.MaxHeight = 8
+	in.SetWidth(100)
+	in.SetHeight(1)
+	// Remove CursorLine background highlight — keeps the input area visually clean.
+	// Disable cursor blink: the virtual cursor fires a tick every ~530ms which
+	// causes a re-render and writes ANSI codes to the terminal, disturbing
+	// WezTerm text selection. A static cursor avoids this entirely.
+	// Clear prompt style so our ANSI-encoded arrow renders as-is.
+	{
+		s := in.Styles()
+		s.Focused.CursorLine = lipgloss.NewStyle()
+		s.Focused.Prompt = lipgloss.NewStyle()
+		s.Blurred.Prompt = lipgloss.NewStyle()
+		s.Cursor.Blink = false
+		in.SetStyles(s)
+	}
+	in.Focus() //nolint
 
-	vp := viewport.New(0, 0)
+	vp := viewport.New()
 	vp.KeyMap = viewport.KeyMap{} // disable all keyboard bindings; mouse wheel only
 
 	// Detect dark/light style NOW, before BubbleTea takes over stdin.
@@ -334,6 +364,12 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+
+	loginIn := textinput.New()
+	loginIn.Placeholder = "sk-..."
+	loginIn.EchoMode = textinput.EchoPassword // hide the key while typing
+	loginIn.EchoCharacter = '•'
+	loginIn.CharLimit = 256
 
 	m := Model{
 		agent:                 ag,
@@ -361,6 +397,7 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 		resourceCmds:          buildResourceCmds(reg, rt),
 		permService:           perm,
 		onProviderLogin:       onProviderLogin,
+		loginInput:            loginIn,
 		modelContextLengths:   make(map[string]int),
 		workingDir:            currentWorkingDir(),
 		gitBranch:             getGitBranch(),
@@ -395,7 +432,7 @@ func NewModel(ag turnRunner, catalog modelCatalog, modelName string, sessions se
 }
 
 func (m Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{textinput.Blink}
+	cmds := []tea.Cmd{}
 	if m.runtime != nil {
 		cmds = append(cmds,
 			fireEventCmd(m.runtime, luaext.Event{Kind: luaext.EventSessionStart}),
@@ -419,27 +456,11 @@ func (m Model) Init() tea.Cmd {
 
 // ── Update ─────────────────────────────────────────────────────────────────────
 
-// Update is the Bubble Tea entrypoint. It routes mouse-wheel events directly
-// to the viewport, then after every other message syncs viewport content and
-// recalculates dimensions so inner handlers never touch the viewport.
+// Update is the Bubble Tea entrypoint. It syncs viewport content and
+// recalculates dimensions so inner handlers never touch the viewport directly.
+// Mouse events are not captured (no WithMouseCellMotion) — the terminal handles
+// selection and scroll natively. The TUI viewport can be scrolled with Page Up/Down.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Mouse-wheel → viewport scroll only in chat mode.
-	if mouse, ok := msg.(tea.MouseMsg); ok && m.mode == chatMode {
-		if mouse.Button == tea.MouseButtonWheelUp || mouse.Button == tea.MouseButtonWheelDown {
-			var vpCmd tea.Cmd
-			m.vp, vpCmd = m.vp.Update(mouse)
-			switch mouse.Button {
-			case tea.MouseButtonWheelUp:
-				m.autoScroll = false // user scrolled up — stop chasing the bottom
-			case tea.MouseButtonWheelDown:
-				if m.vp.AtBottom() {
-					m.autoScroll = true // user scrolled all the way back down
-				}
-			}
-			return m.recalcViewport(), vpCmd
-		}
-	}
-
 	next, cmd := m.doUpdate(msg)
 	nm := next.(Model)
 	nm.vp.SetContent(strings.Join(nm.lines, "\n") + "\n\n\n")
@@ -534,6 +555,9 @@ func (m Model) doUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.mode == loginAuthMode {
 		return m.updateLoginAuth(msg)
 	}
+	if m.mode == loginApiKeyMode {
+		return m.updateLoginApiKey(msg)
+	}
 	return m.updateChat(msg)
 }
 
@@ -542,7 +566,6 @@ func (m Model) updatePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case modelPickedMsg:
 		m.modelName = msg.modelID
 		m.mode = chatMode
-		m.input.Focus()
 		if m.sessions != nil && m.sessionID != "" {
 			if err := m.sessions.SetSessionModel(m.sessionID, m.modelName); err != nil {
 				m.appendBlock(chatBlock{kind: bError, content: "failed to persist model: " + err.Error()})
@@ -552,11 +575,10 @@ func (m Model) updatePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessionInputTokens = 0
 		m.sessionOutputTokens = 0
 		m.appendBlock(chatBlock{kind: bMeta, content: "Model set to " + m.modelName})
-		return m, textinput.Blink
+		return m, m.input.Focus()
 	case modelPickCanceledMsg:
 		m.mode = chatMode
-		m.input.Focus()
-		return m, textinput.Blink
+		return m, m.input.Focus()
 	case favoritesChangedMsg:
 		m.favoriteModels = msg.ids
 		if err := config.SaveFavoriteModels(msg.ids); err != nil {
@@ -574,15 +596,14 @@ func (m Model) updateResumePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case sessionPickedMsg:
 		m.mode = chatMode
-		m.input.Focus()
 		if m.sessions == nil {
 			m.appendBlock(chatBlock{kind: bError, content: "session store not available"})
-			return m, textinput.Blink
+			return m, m.input.Focus()
 		}
 		messages, nodeID, err := m.sessions.LoadLatestMessages(msg.sessionID)
 		if err != nil {
 			m.appendBlock(chatBlock{kind: bError, content: "failed to load session: " + err.Error()})
-			return m, textinput.Blink
+			return m, m.input.Focus()
 		}
 		m.sessionID = msg.sessionID
 		m.currentNodeID = nodeID
@@ -599,12 +620,11 @@ func (m Model) updateResumePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sessionID, shortID(m.currentNodeID), len(messages),
 		)})
 		m.appendBlock(chatBlock{kind: bMeta, content: "Model: " + m.modelName})
-		return m, textinput.Blink
+		return m, m.input.Focus()
 
 	case sessionPickCanceledMsg:
 		m.mode = chatMode
-		m.input.Focus()
-		return m, textinput.Blink
+		return m, m.input.Focus()
 
 	default:
 		var cmd tea.Cmd
@@ -617,15 +637,14 @@ func (m Model) updateNodePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case nodePickedMsg:
 		m.mode = chatMode
-		m.input.Focus()
 		if m.sessions == nil {
 			m.appendBlock(chatBlock{kind: bError, content: "session store not available"})
-			return m, textinput.Blink
+			return m, m.input.Focus()
 		}
 		messages, err := m.sessions.LoadMessagesAtNode(m.sessionID, msg.nodeID)
 		if err != nil {
 			m.appendBlock(chatBlock{kind: bError, content: "failed to load messages at node: " + err.Error()})
-			return m, textinput.Blink
+			return m, m.input.Focus()
 		}
 		m.currentNodeID = msg.nodeID
 		m.history = append([]openrouter.Message{}, messages...)
@@ -637,12 +656,11 @@ func (m Model) updateNodePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 			"Checked out node %s (%d messages)",
 			shortID(m.currentNodeID), len(messages),
 		)})
-		return m, textinput.Blink
+		return m, m.input.Focus()
 
 	case nodePickCanceledMsg:
 		m.mode = chatMode
-		m.input.Focus()
-		return m, textinput.Blink
+		return m, m.input.Focus()
 
 	default:
 		var cmd tea.Cmd
@@ -653,7 +671,7 @@ func (m Model) updateNodePicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		// ── suggestion navigation ──────────────────────────────────────────
 		if len(m.suggestions) > 0 {
 			switch msg.String() {
@@ -675,6 +693,22 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.suggCursor = 0
 				return m, nil
 			}
+		}
+
+		// ── viewport scroll (keyboard) ────────────────────────────────────
+		// Page Up / Page Down (and ctrl+k / ctrl+j) let the user scroll the
+		// chat history.
+		switch msg.String() {
+		case "pgup", "ctrl+k":
+			m.vp.HalfPageUp()
+			m.autoScroll = false
+			return m, nil
+		case "pgdown", "ctrl+j":
+			m.vp.HalfPageDown()
+			if m.vp.AtBottom() {
+				m.autoScroll = true
+			}
+			return m, nil
 		}
 
 		// ── normal chat keys ───────────────────────────────────────────────
@@ -713,6 +747,14 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m = m.triggerShellCompletion()
 				return m, nil
 			}
+		case "shift+enter", "alt+enter":
+			// Insert a newline without submitting.
+			// shift+enter: works with bubbletea v2 keyboard enhancements (kitty protocol).
+			// alt+enter (\x1b+CR): works on most terminals including WezTerm.
+			if !m.running {
+				m.input.InsertRune('\n')
+			}
+			return m, nil
 		case "enter":
 			if m.running {
 				return m, nil
@@ -762,11 +804,32 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case usageMsg:
 		m.sessionInputTokens += msg.inputTokens
 		m.sessionOutputTokens += msg.outputTokens
+		m.lastInputTokens = msg.inputTokens
+		return m, waitForStream(m.streamCh)
+
+	case assistantRoundMsg:
+		// Persist the complete assistant message (with all tool calls)
+		// as soon as the LLM round completes. This makes the session
+		// crash-safe: if the process dies mid-tool-execution, the
+		// assistant's request is already on disk.
+		m.collapseThinkingBlock()
+		if m.streamingAssistantIdx >= 0 {
+			if strings.TrimSpace(msg.message.Content) != "" {
+				m.chatBlocks[m.streamingAssistantIdx].content = msg.message.Content
+			}
+			m.chatBlocks[m.streamingAssistantIdx].streaming = false
+			m.updateBlock(m.streamingAssistantIdx)
+		}
+		m.streamingAssistantIdx = -1
+		m.history = append(m.history, msg.message)
+		if m.sessions != nil && m.sessionID != "" {
+			if nodeID, err := m.sessions.AppendMessages(m.sessionID, m.currentNodeID, []openrouter.Message{msg.message}); err == nil {
+				m.currentNodeID = nodeID
+			}
+		}
 		return m, waitForStream(m.streamCh)
 
 	case toolCallMsg:
-		m.collapseThinkingBlock()
-		m.streamingAssistantIdx = -1
 		m.appendBlock(chatBlock{kind: bSep})
 		// streaming=true means "still running"; flipped to false in toolResultMsg.
 		m.appendBlock(chatBlock{kind: bToolCall, toolName: msg.name, toolArgs: msg.args, streaming: true})
@@ -798,6 +861,18 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			isErr:     msg.err != nil,
 			collapsed: m.toolResultsCollapsed,
 		})
+		// Persist tool result immediately.
+		toolMsg := openrouter.Message{
+			Role:    "tool",
+			Name:    msg.name,
+			Content: content,
+		}
+		if m.sessions != nil && m.sessionID != "" {
+			if nodeID, err := m.sessions.AppendMessages(m.sessionID, m.currentNodeID, []openrouter.Message{toolMsg}); err == nil {
+				m.currentNodeID = nodeID
+			}
+		}
+		m.history = append(m.history, toolMsg)
 		return m, waitForStream(m.streamCh)
 
 	case turnDoneMsg:
@@ -810,6 +885,9 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.collapseThinkingBlock()
 		// Finalize the streaming assistant block with glamour-rendered markdown.
+		// If this is a plain response (no tool calls), persist the assistant message.
+		// Tool-call assistant messages and tool results are already persisted
+		// incrementally in the toolCallMsg / toolResultMsg handlers.
 		if m.streamingAssistantIdx >= 0 {
 			final := lastAssistantContent(msg.newMessages)
 			if strings.TrimSpace(final) != "" {
@@ -817,19 +895,26 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.chatBlocks[m.streamingAssistantIdx].streaming = false
 			m.updateBlock(m.streamingAssistantIdx)
-		}
-		m.streamingAssistantIdx = -1
-		if len(msg.newMessages) > 0 {
-			m.history = append(m.history, msg.newMessages...)
+			// Persist the final assistant message if it hasn't been persisted
+			// yet (i.e. no tool calls triggered incremental persistence).
+			var reasoningContent string
+			if m.streamingThinkingIdx >= 0 {
+				reasoningContent = m.chatBlocks[m.streamingThinkingIdx].content
+			}
+			assistantMsg := openrouter.Message{
+				Role:             "assistant",
+				Content:          m.chatBlocks[m.streamingAssistantIdx].content,
+				ReasoningContent: reasoningContent,
+				StopReason:       "complete",
+			}
 			if m.sessions != nil && m.sessionID != "" {
-				nodeID, err := m.sessions.AppendMessages(m.sessionID, m.currentNodeID, msg.newMessages)
-				if err != nil {
-					m.appendBlock(chatBlock{kind: bError, content: "session write failed: " + err.Error()})
-				} else {
+				if nodeID, err := m.sessions.AppendMessages(m.sessionID, m.currentNodeID, []openrouter.Message{assistantMsg}); err == nil {
 					m.currentNodeID = nodeID
 				}
 			}
+			m.history = append(m.history, assistantMsg)
 		}
+		m.streamingAssistantIdx = -1
 		if m.runtime != nil {
 			return m, fireEventCmd(m.runtime, luaext.Event{Kind: luaext.EventTurnEnd})
 		}
@@ -839,16 +924,43 @@ func (m Model) updateChat(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.running = false
 		m = m.syncPrompt() // cat icon → green again
 		m.collapseThinkingBlock()
-		m.streamingAssistantIdx = -1
 		if m.cancelTurn != nil {
 			m.cancelTurn()
 			m.cancelTurn = nil
 		}
+
+		// Persist partial messages on cancellation so the user's visible
+		// streamed output is not silently lost. On error we skip this
+		// because partial state may be inconsistent.
 		if errors.Is(msg.err, context.Canceled) {
+			var partialMsgs []openrouter.Message
+			if m.streamingAssistantIdx >= 0 {
+				partial := m.chatBlocks[m.streamingAssistantIdx].content
+				if strings.TrimSpace(partial) != "" {
+					msg := openrouter.Message{
+						Role:       "assistant",
+						Content:    partial,
+						StopReason: "cancelled",
+					}
+					if m.streamingThinkingIdx >= 0 {
+						msg.ReasoningContent = m.chatBlocks[m.streamingThinkingIdx].content
+					}
+					partialMsgs = append(partialMsgs, msg)
+				}
+			}
+			if len(partialMsgs) > 0 {
+				m.history = append(m.history, partialMsgs...)
+				if m.sessions != nil && m.sessionID != "" {
+					if nodeID, err := m.sessions.AppendMessages(m.sessionID, m.currentNodeID, partialMsgs); err == nil {
+						m.currentNodeID = nodeID
+					}
+				}
+			}
 			m.appendBlock(chatBlock{kind: bError, content: "Cancelled."})
 		} else {
 			m.appendBlock(chatBlock{kind: bError, content: "Error: " + msg.err.Error()})
 		}
+		m.streamingAssistantIdx = -1
 		return m, nil
 
 	case extCommandDoneMsg:
@@ -916,13 +1028,17 @@ func (m Model) updateSuggestions() Model {
 	//   /  cyan   — slash command
 	//   default   — normal (no override)
 	// The prompt arrow colour is handled inside syncPrompt / buildPromptStr.
-	switch {
-	case strings.HasPrefix(val, "!"):
-		m.input.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-	case strings.HasPrefix(val, "/"):
-		m.input.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	default:
-		m.input.TextStyle = lipgloss.NewStyle()
+	{
+		s := m.input.Styles()
+		switch {
+		case strings.HasPrefix(val, "!"):
+			s.Focused.Text = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+		case strings.HasPrefix(val, "/"):
+			s.Focused.Text = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
+		default:
+			s.Focused.Text = lipgloss.NewStyle()
+		}
+		m.input.SetStyles(s)
 	}
 	m = m.syncPrompt()
 
@@ -969,7 +1085,7 @@ func (m Model) applyPathSuggestion() Model {
 	}
 	chosen := m.suggestions[m.suggCursor]
 	val := m.input.Value()
-	pos := m.input.Position()
+	pos := m.inputBytePos()
 	textAfter := val[pos:]
 
 	newVal := m.shellCompletionBase + chosen.name + textAfter
@@ -996,7 +1112,7 @@ func (m Model) triggerShellCompletion() Model {
 	if !strings.HasPrefix(val, "!") {
 		return m
 	}
-	pos := m.input.Position()
+	pos := m.inputBytePos()
 	textBefore := val[:pos]
 	shellText := textBefore[1:] // strip leading '!'
 
@@ -1042,6 +1158,17 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	userMsg := openrouter.Message{Role: "user", Content: value}
+	m.history = append(m.history, userMsg)
+	if m.sessions != nil && m.sessionID != "" {
+		nodeID, err := m.sessions.AppendMessages(m.sessionID, m.currentNodeID, []openrouter.Message{userMsg})
+		if err != nil {
+			m.appendBlock(chatBlock{kind: bError, content: "session write failed: " + err.Error()})
+		} else {
+			m.currentNodeID = nodeID
+		}
+	}
+
 	m.appendBlock(chatBlock{kind: bSep})
 	m.appendBlock(chatBlock{kind: bUser, content: value})
 	m.streamingAssistantIdx = -1
@@ -1053,9 +1180,11 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 	m.cancelTurn = cancel
 	// Build LLM history, excluding "cmd" nodes (shell commands recorded for
 	// display purposes only — they are not part of the model conversation).
+	// Exclude the last message (the user message we just appended above);
+	// the agent adds it itself.
 	history := make([]openrouter.Message, 0, len(m.history))
-	for _, msg := range m.history {
-		if msg.Role != "cmd" {
+	for i, msg := range m.history {
+		if msg.Role != "cmd" && i < len(m.history)-1 {
 			history = append(history, msg)
 		}
 	}
@@ -1087,6 +1216,9 @@ func (m Model) submitPrompt(value string) (tea.Model, tea.Cmd) {
 			},
 			OnUsage: func(u openrouter.Usage) {
 				ch <- usageMsg{inputTokens: u.InputTokens, outputTokens: u.OutputTokens}
+			},
+			OnAssistantMessage: func(msg openrouter.Message) {
+				ch <- assistantRoundMsg{message: msg}
 			},
 			// BeforeToolCall fires EventToolCall synchronously in the agent goroutine
 			// so Lua handlers can block execution before it happens.
@@ -1137,6 +1269,9 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 	case "/login":
 		return m.enterLoginSelect()
 
+	case "/logout":
+		return m.handleLogout(parts[1:])
+
 	case "/quit":
 		if m.runtime != nil {
 			m.runtime.Fire(luaext.Event{Kind: luaext.EventSessionShutdown}) //nolint
@@ -1175,8 +1310,8 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 		if pickerW == 0 {
 			pickerW = 120
 		}
-		m.picker = newPicker(pickerW, pickerH, m.favoriteModels)
-		return m, tea.Batch(fetchModels(m.catalog), textinput.Blink)
+		m.picker = newPicker(pickerW, pickerH, m.favoriteModels, m.modelName)
+		return m, fetchModels(m.catalog)
 
 	case "/new":
 		if m.sessions == nil {
@@ -1218,7 +1353,7 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			h = 40
 		}
 		m.sessionPicker = newSessionPicker(w, h)
-		return m, tea.Batch(fetchSessions(m.sessions), textinput.Blink)
+		return m, fetchSessions(m.sessions)
 
 	case "/label":
 		if m.sessions == nil {
@@ -1273,6 +1408,9 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 			{kb.CancelTurn, "cancel running assistant turn"},
 			{kb.ToggleThinking, "toggle thinking blocks"},
 			{kb.ToggleTools, "toggle tool result blocks"},
+			{"shift+enter / alt+enter", "insert newline (multi-line message)"},
+			{"pgup / ctrl+k", "scroll chat viewport up"},
+			{"pgdown / ctrl+j", "scroll chat viewport down"},
 		}
 		// measure longest key for alignment
 		maxLen := 0
@@ -1371,25 +1509,29 @@ func (m Model) handleCommand(raw string) (tea.Model, tea.Cmd) {
 
 // ── View ───────────────────────────────────────────────────────────────────────
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
 	header := m.renderHeader()
+	var content string
 	if m.mode == pickerMode {
-		return lipgloss.JoinVertical(lipgloss.Left, header, "", m.picker.View())
+		content = lipgloss.JoinVertical(lipgloss.Left, header, "", m.picker.View())
+	} else if m.mode == resumeMode {
+		content = lipgloss.JoinVertical(lipgloss.Left, header, "", m.sessionPicker.View())
+	} else if m.mode == nodePickMode {
+		content = lipgloss.JoinVertical(lipgloss.Left, header, "", m.nodePicker.View())
+	} else {
+		content = m.viewChat(header)
 	}
-	if m.mode == resumeMode {
-		return lipgloss.JoinVertical(lipgloss.Left, header, "", m.sessionPicker.View())
-	}
-	if m.mode == nodePickMode {
-		return lipgloss.JoinVertical(lipgloss.Left, header, "", m.nodePicker.View())
-	}
-	return m.viewChat(header)
+	v := tea.NewView(content)
+	// Request keyboard enhancements so shift+enter is reported distinctly.
+	v.KeyboardEnhancements = tea.KeyboardEnhancements{}
+	return v
 }
 
 // viewChatWithPermDialog renders the chat view with the permission dialog
 // replacing the normal input at the bottom.
 func (m Model) viewChatWithPermDialog(header string) string {
 	var statusLine string
-	below := m.vp.TotalLineCount() - m.vp.YOffset - m.vp.Height
+	below := m.vp.TotalLineCount() - m.vp.YOffset() - m.vp.Height()
 	if below > 0 {
 		statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more  ", below))
 	}
@@ -1426,6 +1568,9 @@ func (m Model) renderHeader() string {
 	if m.mode == loginAuthMode {
 		status = "login: authenticating"
 	}
+	if m.mode == loginApiKeyMode {
+		status = "login: enter API key"
+	}
 	sessionText := "none"
 	if m.sessionID != "" {
 		sessionText = m.sessionID
@@ -1447,13 +1592,16 @@ func (m Model) viewChat(header string) string {
 	if m.mode == loginAuthMode {
 		return m.viewChatWithLoginAuth(header)
 	}
+	if m.mode == loginApiKeyMode {
+		return m.viewChatWithLoginApiKey(header)
+	}
 	// One reserved line between viewport and input: spinner while running,
 	// scroll indicator when scrolled up, blank otherwise.
 	var statusLine string
 	if m.running {
 		spinnerView := m.spinner.View()
 		if !m.vp.AtBottom() {
-			below := m.vp.TotalLineCount() - m.vp.YOffset - m.vp.Height
+			below := m.vp.TotalLineCount() - m.vp.YOffset() - m.vp.Height()
 			if below > 0 {
 				statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more  ", below)) + spinnerView
 			} else {
@@ -1463,7 +1611,7 @@ func (m Model) viewChat(header string) string {
 			statusLine = spinnerView
 		}
 	} else if !m.vp.AtBottom() {
-		below := m.vp.TotalLineCount() - m.vp.YOffset - m.vp.Height
+		below := m.vp.TotalLineCount() - m.vp.YOffset() - m.vp.Height()
 		if below > 0 {
 			statusLine = metaStyle.Render(fmt.Sprintf("  ↓ %d more", below))
 		}
@@ -1492,9 +1640,8 @@ func (m Model) renderStatusBar() string {
 		ctxLen := m.modelContextLengths[m.modelName]
 		stats := "in " + formatTokenCount(m.sessionInputTokens) +
 			"  out " + formatTokenCount(m.sessionOutputTokens)
-		if ctxLen > 0 {
-			total := m.sessionInputTokens + m.sessionOutputTokens
-			pct := total * 100 / ctxLen
+		if ctxLen > 0 && m.lastInputTokens > 0 {
+			pct := m.lastInputTokens * 100 / ctxLen
 			stats += "  " + fmt.Sprintf("%d%%", pct) + " of " + formatTokenCount(ctxLen) + " ctx"
 		}
 		parts = append(parts, stats)
@@ -1570,6 +1717,37 @@ func (m Model) renderSuggestions() string {
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
+// inputVisualLines returns the number of visual lines the textarea content
+// occupies, accounting for soft wrapping. textarea.LineCount() only returns
+// hard lines (separated by \n), so a single long line returns 1 even when it
+// wraps to multiple visual lines. This function computes the rendered height
+// by wrapping each hard line at the textarea's text width.
+func inputVisualLines(ta textarea.Model) int {
+	textWidth := ta.Width()
+	if textWidth <= 0 {
+		return max(1, ta.LineCount())
+	}
+	val := ta.Value()
+	if val == "" {
+		return 1
+	}
+	total := 0
+	for _, line := range strings.Split(val, "\n") {
+		col := 0
+		lines := 1
+		for _, r := range line {
+			w := rw.RuneWidth(r)
+			col += w
+			if col > textWidth {
+				lines++
+				col = w
+			}
+		}
+		total += lines
+	}
+	return max(1, total)
+}
+
 // recalcViewport adjusts viewport dimensions to fit the current chrome (header,
 // scroll indicator, suggestions, input, optional status bar) and scrolls to the
 // bottom when autoScroll is true.
@@ -1583,6 +1761,20 @@ func (m Model) recalcViewport() Model {
 		headerLines = max(1, (lipgloss.Width(m.renderHeader())+m.width-1)/m.width)
 	}
 
+	// Keep textarea height in sync with content (auto-grow up to MaxHeight=8).
+	// Use visual line count (accounting for soft wrapping) instead of hard
+	// lines so the textarea grows when a single long line wraps.
+	{
+		h := inputVisualLines(m.input)
+		if h < 1 {
+			h = 1
+		}
+		if h > 8 {
+			h = 8
+		}
+		m.input.SetHeight(h)
+	}
+
 	var chrome int
 	if m.mode == permissionMode {
 		// header + blank(1) + scrollLine(1) + dialog
@@ -1591,19 +1783,21 @@ func (m Model) recalcViewport() Model {
 		chrome = headerLines + 1 + 1 + loginSelectChrome - 1
 	} else if m.mode == loginAuthMode {
 		chrome = headerLines + 1 + 1 + loginAuthChrome - 1
+	} else if m.mode == loginApiKeyMode {
+		chrome = headerLines + 1 + 1 + loginApiKeyChrome - 1
 	} else {
-		// header + blank(1) + scrollLine(1) + input(1)
+		// header + blank(1) + scrollLine(1) + input(variable height)
 		visibleSuggs := len(m.suggestions)
 		if visibleSuggs > 10 {
 			visibleSuggs = 10 + 1 // +1 for the "… N more" line
 		}
-		chrome = headerLines + 3 + visibleSuggs
+		chrome = headerLines + 2 + m.input.Height() + visibleSuggs
 		if m.renderStatusBar() != "" {
 			chrome++ // status bar
 		}
 	}
-	m.vp.Width = m.width
-	m.vp.Height = max(3, m.height-chrome)
+	m.vp.SetWidth(m.width)
+	m.vp.SetHeight(max(3, m.height-chrome))
 	if m.autoScroll {
 		m.vp.GotoBottom()
 	}
@@ -1701,15 +1895,8 @@ func getGitBranch() string {
 //	arrow ❯     peach     #f5a97f  (yellow for !, cyan for /)
 //	git branch  mauve     #c6a0f6
 func (m Model) buildPromptStr() string {
-	dir := fishAbbrevPath(m.workingDir)
-
-	// Cat icon colour: red while the agent is running.
-	catStyle := promptCatGreen
-	if m.running {
-		catStyle = promptCatRed
-	}
-
-	// Arrow colour: reflects the current input mode.
+	// Minimal prompt: just the arrow, coloured by input mode.
+	// peach = normal, yellow = ! shell, cyan = / command.
 	arrowStyle := promptArrowPeach
 	val := m.input.Value()
 	switch {
@@ -1718,29 +1905,35 @@ func (m Model) buildPromptStr() string {
 	case strings.HasPrefix(val, "/"):
 		arrowStyle = promptArrowCyan
 	}
-
-	// Assemble prompt segments.
-	prompt := promptDirStyle.Render(dir) +
-		" " + catStyle.Render("󰄛") +
-		" " + arrowStyle.Render("❯")
-
-	if m.gitBranch != "" {
-		prompt += " " + promptBranchStyle.Render(" "+m.gitBranch)
-	}
-
-	prompt += "  " // breathing room before user text
-	return prompt
+	return arrowStyle.Render("❯") + "  "
 }
 
-// syncPrompt rebuilds the textinput prompt string and adjusts the input width
+// syncPrompt rebuilds the textarea prompt string and adjusts the input width
 // so the total line always fits within the terminal width.
+// The arrow (❯) is shown only on the first line; continuation lines get a
+// blank indent of the same width so the text aligns.
 func (m Model) syncPrompt() Model {
 	prompt := m.buildPromptStr()
-	m.input.Prompt = prompt
-	m.input.PromptStyle = lipgloss.NewStyle() // identity — ANSI already embedded
+	pw := lipgloss.Width(prompt)
+	blank := strings.Repeat(" ", pw)
+
+	// Use SetPromptFunc so continuation lines show a blank indent instead of
+	// repeating the arrow on every line.
+	m.input.SetPromptFunc(pw, func(info textarea.PromptInfo) string {
+		if info.LineNumber == 0 {
+			return prompt
+		}
+		return blank
+	})
+	// Clear prompt style so our ANSI-encoded arrow renders as-is.
+	{
+		s := m.input.Styles()
+		s.Focused.Prompt = lipgloss.NewStyle()
+		s.Blurred.Prompt = lipgloss.NewStyle()
+		m.input.SetStyles(s)
+	}
 	if m.width > 0 {
-		pw := lipgloss.Width(prompt)
-		m.input.Width = max(20, m.width-pw)
+		m.input.SetWidth(max(20, m.width-pw))
 	}
 	return m
 }
@@ -1777,7 +1970,7 @@ func prefixEachLine(prefix, s string) string {
 // applyBackground pads every line of content to width cols and applies bg.
 // This gives each block a consistent rectangular background without using
 // lipgloss Width() on the outer container.
-func applyBackground(content string, bg lipgloss.Color, width int) string {
+func applyBackground(content string, bg color.Color, width int) string {
 	bgStyle := lipgloss.NewStyle().Background(bg).Width(width)
 	lines := strings.Split(content, "\n")
 	for i, line := range lines {
@@ -1924,10 +2117,10 @@ func (m Model) renderBlock(b chatBlock) string {
 
 		if b.collapsed && len(lines) > toolResultPreviewLines {
 			out = append(out, toolTruncStyle.Render(fmt.Sprintf(
-				"    … %d more lines  [alt+r to expand]", len(lines)-toolResultPreviewLines,
+				"    … %d more lines  [ctrl+r to expand]", len(lines)-toolResultPreviewLines,
 			)))
 		} else if !b.collapsed && len(lines) > toolResultPreviewLines {
-			out = append(out, toolTruncStyle.Render("    [alt+r to collapse]"))
+			out = append(out, toolTruncStyle.Render("    [ctrl+r to collapse]"))
 		}
 		return strings.Join(out, "\n")
 	}
@@ -1995,6 +2188,15 @@ func (m *Model) appendHistoryBlocks(messages []openrouter.Message) {
 				m.appendBlock(chatBlock{kind: bUser, content: msg.Content})
 			}
 		case "assistant":
+			// Show stored reasoning content as a thinking block.
+			if strings.TrimSpace(msg.ReasoningContent) != "" {
+				m.appendBlock(chatBlock{kind: bSep})
+				m.appendBlock(chatBlock{
+					kind:      bThinking,
+					content:   msg.ReasoningContent,
+					collapsed: m.thinkingCollapsed,
+				})
+			}
 			if strings.TrimSpace(msg.Content) != "" {
 				m.appendBlock(chatBlock{kind: bSep})
 				// streaming: false → renderBlock will use glamour
@@ -2133,6 +2335,25 @@ func shortID(id string) string {
 	return id[:12]
 }
 
+
+// inputBytePos returns the approximate byte offset of the textarea cursor
+// within the current input value. Used for shell path completion (ASCII-safe).
+func (m Model) inputBytePos() int {
+	row := m.input.Line()
+	li := m.input.LineInfo()
+	if row == 0 {
+		return li.CharOffset
+	}
+	val := m.input.Value()
+	lines := strings.Split(val, "\n")
+	pos := 0
+	for i := 0; i < row && i < len(lines); i++ {
+		pos += len(lines[i]) + 1 // +1 for the '\n'
+	}
+	pos += li.CharOffset
+	return pos
+}
+
 func lastAssistantContent(messages []openrouter.Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "assistant" && strings.TrimSpace(messages[i].Content) != "" {
@@ -2206,9 +2427,14 @@ func renderLinearTree(children map[string][]session.Node, roots []session.Node, 
 		if node.ID == currentNodeID {
 			marker = "*"
 		}
-		desc := summarize(node.Message.Content)
-		if desc == "(no output)" {
-			desc = ""
+		var desc string
+		if node.Message.Role == "cmd" {
+			desc = strings.SplitN(node.Message.Content, "\n", 2)[0]
+		} else {
+			desc = summarize(node.Message.Content)
+			if desc == "(no output)" {
+				desc = ""
+			}
 		}
 		line := fmt.Sprintf("• %s %s [%s]", marker, shortID(node.ID), node.Message.Role)
 		if desc != "" {
@@ -2223,21 +2449,30 @@ func renderLinearTree(children map[string][]session.Node, roots []session.Node, 
 
 // updatePermission handles keyboard input while a permission dialog is shown.
 func (m Model) updatePermission(msg tea.Msg) (tea.Model, tea.Cmd) {
-	key, ok := msg.(tea.KeyMsg)
+	key, ok := msg.(tea.KeyPressMsg)
 	if !ok {
-		// Pass stream messages through so the spinner keeps ticking.
+		// Pass spinner ticks through.
 		if _, spin := msg.(spinner.TickMsg); spin && m.running {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
+		}
+		// The agent goroutine may produce stream messages (toolResultMsg,
+		// turnDoneMsg, etc.) while the permission dialog is still visible
+		// due to a race between Grant() unblocking the goroutine and the
+		// TUI processing the dialog-close.  Forward these to the normal
+		// chat update handler so they are not lost.
+		switch msg.(type) {
+		case toolCallMsg, toolResultMsg, tokenMsg, thinkingTokenMsg,
+			usageMsg, assistantRoundMsg, turnDoneMsg, turnErrMsg:
+			return m.updateChat(msg)
 		}
 		return m, nil
 	}
 
 	if m.currentPerm == nil || m.permService == nil {
 		m.mode = chatMode
-		m.input.Focus()
-		return m, textinput.Blink
+		return m, m.input.Focus()
 	}
 
 	id := m.currentPerm.ID
@@ -2246,17 +2481,19 @@ func (m Model) updatePermission(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "y", "Y", "a", "A", "enter":
 		// Allow once.
 		m.permService.Grant(id)
+		m.appendBlock(chatBlock{kind: bMeta, content: fmt.Sprintf("✅ Permission granted: %s %s", m.currentPerm.ToolName, permPathDisplay(m.currentPerm))})
 		return m.closePermDialog()
 
 	case "s", "S":
 		// Allow for session — cache this specific tool+action+path.
 		m.permService.GrantPersistent(id)
+		m.appendBlock(chatBlock{kind: bMeta, content: fmt.Sprintf("✅ Permission granted for session: %s %s", m.currentPerm.ToolName, permPathDisplay(m.currentPerm))})
 		return m.closePermDialog()
 
 	case "n", "N", "d", "D", "esc":
 		// Deny.
 		m.permService.Deny(id)
-		m.appendBlock(chatBlock{kind: bError, content: fmt.Sprintf("⛔ Permission denied: %s %s", m.currentPerm.ToolName, m.currentPerm.Action)})
+		m.appendBlock(chatBlock{kind: bError, content: fmt.Sprintf("⛔ Permission denied: %s %s", m.currentPerm.ToolName, permPathDisplay(m.currentPerm))})
 		return m.closePermDialog()
 	}
 
@@ -2267,13 +2504,36 @@ func (m Model) updatePermission(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) closePermDialog() (tea.Model, tea.Cmd) {
 	m.currentPerm = nil
 	m.mode = chatMode
-	m.input.Focus()
 	// Resume listening for the next permission request.
 	var permCmd tea.Cmd
 	if m.permService != nil {
 		permCmd = waitForPermission(m.permService.Subscribe())
 	}
-	return m, tea.Batch(textinput.Blink, permCmd)
+	// Resume the stream listener so tool results from the now-unblocked
+	// agent goroutine are delivered.
+	var cmds []tea.Cmd
+	cmds = append(cmds, m.input.Focus(), permCmd)
+	if m.streamCh != nil {
+		cmds = append(cmds, waitForStream(m.streamCh))
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// permPathDisplay returns a short human-readable description of a permission
+// request for use in TUI feedback messages (e.g. "write /etc/hosts").
+func permPathDisplay(req *permission.Request) string {
+	if req.Path != "" {
+		return req.Path
+	}
+	if bp, ok := req.Params.(permission.BashParams); ok && bp.Command != "" {
+		// Show first 60 chars of the command.
+		cmd := bp.Command
+		if len(cmd) > 60 {
+			cmd = cmd[:60] + "…"
+		}
+		return cmd
+	}
+	return req.Action
 }
 
 // renderPermDialog renders the permission request dialog box.

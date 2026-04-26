@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"pigeon/internal/provider/openrouter"
 )
@@ -18,7 +18,7 @@ var pickerModels = []openrouter.ModelInfo{
 }
 
 func loadedPicker() picker {
-	p := newPicker(120, 30, nil)
+	p := newPicker(120, 30, nil, "")
 	p2, _ := p.Update(modelLoadedMsg{models: pickerModels})
 	return p2
 }
@@ -26,21 +26,21 @@ func loadedPicker() picker {
 // ── newPicker / listHeight ────────────────────────────────────────────────────
 
 func TestNewPicker_StartsLoading(t *testing.T) {
-	p := newPicker(80, 24, nil)
+	p := newPicker(80, 24, nil, "")
 	if !p.loading {
 		t.Error("picker should start in loading state")
 	}
 }
 
 func TestPickerListHeight_Positive(t *testing.T) {
-	p := newPicker(80, 24, nil)
+	p := newPicker(80, 24, nil, "")
 	if p.listHeight() <= 0 {
 		t.Errorf("listHeight should be positive, got %d", p.listHeight())
 	}
 }
 
 func TestPickerListHeight_SmallTerminal(t *testing.T) {
-	p := newPicker(80, 4, nil)
+	p := newPicker(80, 4, nil, "")
 	if p.listHeight() < 3 {
 		t.Errorf("listHeight minimum should be 3, got %d", p.listHeight())
 	}
@@ -49,7 +49,7 @@ func TestPickerListHeight_SmallTerminal(t *testing.T) {
 // ── Update: loading states ────────────────────────────────────────────────────
 
 func TestPickerUpdate_ModelLoaded(t *testing.T) {
-	p := newPicker(120, 30, nil)
+	p := newPicker(120, 30, nil, "")
 	p2, _ := p.Update(modelLoadedMsg{models: pickerModels})
 	if p2.loading {
 		t.Error("should not be loading after modelLoadedMsg")
@@ -63,7 +63,7 @@ func TestPickerUpdate_ModelLoaded(t *testing.T) {
 }
 
 func TestPickerUpdate_LoadError(t *testing.T) {
-	p := newPicker(80, 24, nil)
+	p := newPicker(80, 24, nil, "")
 	p2, _ := p.Update(modelLoadErrMsg{err: testErr("connection refused")})
 	if p2.loading {
 		t.Error("should not be loading after error")
@@ -77,7 +77,7 @@ func TestPickerUpdate_LoadError(t *testing.T) {
 
 func TestPickerUpdate_DownMoveCursor(t *testing.T) {
 	p := loadedPicker()
-	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyDown})
+	p2, _ := p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if p2.cursor != 1 {
 		t.Errorf("expected cursor=1, got %d", p2.cursor)
 	}
@@ -85,7 +85,7 @@ func TestPickerUpdate_DownMoveCursor(t *testing.T) {
 
 func TestPickerUpdate_UpAtZeroStaysZero(t *testing.T) {
 	p := loadedPicker()
-	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyUp})
+	p2, _ := p.Update(tea.KeyPressMsg{Code: tea.KeyUp})
 	if p2.cursor != 0 {
 		t.Errorf("up at 0 should stay 0, got %d", p2.cursor)
 	}
@@ -93,15 +93,15 @@ func TestPickerUpdate_UpAtZeroStaysZero(t *testing.T) {
 
 func TestPickerUpdate_CtrlN_CtrlP(t *testing.T) {
 	p := loadedPicker()
-	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n"), Alt: false})
+	p2, _ := p.Update(tea.KeyPressMsg{Code: 'n', Text: "n"})
 	// ctrl+n
-	p3, _ := p.Update(tea.KeyMsg{Type: tea.KeyCtrlN})
+	p3, _ := p.Update(tea.KeyPressMsg{Code: 'n', Mod: tea.ModCtrl})
 	if p3.cursor != 1 {
 		t.Errorf("ctrl+n should move cursor down: got %d", p3.cursor)
 	}
 	_ = p2
 
-	p4, _ := p3.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+	p4, _ := p3.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
 	if p4.cursor != 0 {
 		t.Errorf("ctrl+p should move cursor up: got %d", p4.cursor)
 	}
@@ -110,7 +110,7 @@ func TestPickerUpdate_CtrlN_CtrlP(t *testing.T) {
 func TestPickerUpdate_DownDoesNotExceedList(t *testing.T) {
 	p := loadedPicker()
 	for range len(pickerModels) + 5 {
-		p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
+		p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	}
 	if p.cursor >= len(pickerModels) {
 		t.Errorf("cursor exceeded list: %d >= %d", p.cursor, len(pickerModels))
@@ -121,7 +121,7 @@ func TestPickerUpdate_DownDoesNotExceedList(t *testing.T) {
 
 func TestPickerUpdate_EnterEmitsPickedMsg(t *testing.T) {
 	p := loadedPicker()
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if cmd == nil {
 		t.Fatal("expected cmd after enter")
 	}
@@ -137,9 +137,9 @@ func TestPickerUpdate_EnterEmitsPickedMsg(t *testing.T) {
 
 func TestPickerUpdate_EnterSelectsHighlightedModel(t *testing.T) {
 	p := loadedPicker()
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	msg := cmd()
 	picked := msg.(modelPickedMsg)
 	if picked.modelID != pickerModels[2].ID {
@@ -149,7 +149,7 @@ func TestPickerUpdate_EnterSelectsHighlightedModel(t *testing.T) {
 
 func TestPickerUpdate_EscEmitsCancelMsg(t *testing.T) {
 	p := loadedPicker()
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	if cmd == nil {
 		t.Fatal("expected cmd after esc")
 	}
@@ -161,7 +161,7 @@ func TestPickerUpdate_EscEmitsCancelMsg(t *testing.T) {
 
 func TestPickerUpdate_CtrlC_Cancels(t *testing.T) {
 	p := loadedPicker()
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
 	if cmd == nil {
 		t.Fatal("expected cmd")
 	}
@@ -175,7 +175,7 @@ func TestPickerUpdate_CtrlC_Cancels(t *testing.T) {
 func TestPickerUpdate_TypingFilters(t *testing.T) {
 	p := loadedPicker()
 	for _, ch := range "claude" {
-		p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		p, _ = p.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 	}
 	if len(p.filtered) != 1 {
 		t.Errorf("expected 1 result for 'claude', got %d", len(p.filtered))
@@ -187,10 +187,10 @@ func TestPickerUpdate_TypingFilters(t *testing.T) {
 
 func TestPickerUpdate_FilterResetsCursor(t *testing.T) {
 	p := loadedPicker()
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown})
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	// cursor is now 2; typing should reset to 0
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	p, _ = p.Update(tea.KeyPressMsg{Code: 'c', Text: string('c')})
 	if p.cursor != 0 {
 		t.Errorf("cursor should reset to 0 after filter change, got %d", p.cursor)
 	}
@@ -199,9 +199,9 @@ func TestPickerUpdate_FilterResetsCursor(t *testing.T) {
 func TestPickerUpdate_NoResultsOnEnter(t *testing.T) {
 	p := loadedPicker()
 	for _, ch := range "zzznomatch" {
-		p, _ = p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		p, _ = p.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
 	}
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	// cmd should be nil (nothing to pick)
 	if cmd != nil {
 		t.Error("enter with no results should return nil cmd")
@@ -211,7 +211,7 @@ func TestPickerUpdate_NoResultsOnEnter(t *testing.T) {
 // ── Update: window resize ─────────────────────────────────────────────────────
 
 func TestPickerUpdate_WindowResize(t *testing.T) {
-	p := newPicker(80, 24, nil)
+	p := newPicker(80, 24, nil, "")
 	p2, _ := p.Update(tea.WindowSizeMsg{Width: 160, Height: 50})
 	if p2.width != 160 || p2.height != 50 {
 		t.Errorf("expected 160x50, got %dx%d", p2.width, p2.height)
@@ -221,7 +221,7 @@ func TestPickerUpdate_WindowResize(t *testing.T) {
 // ── View ──────────────────────────────────────────────────────────────────────
 
 func TestPickerView_LoadingState(t *testing.T) {
-	p := newPicker(80, 24, nil)
+	p := newPicker(80, 24, nil, "")
 	view := p.View()
 	if !strings.Contains(strings.ToLower(view), "loading") {
 		t.Errorf("expected loading message: %q", view)
@@ -229,7 +229,7 @@ func TestPickerView_LoadingState(t *testing.T) {
 }
 
 func TestPickerView_ErrorState(t *testing.T) {
-	p := newPicker(80, 24, nil)
+	p := newPicker(80, 24, nil, "")
 	p2, _ := p.Update(modelLoadErrMsg{err: testErr("timed out")})
 	view := p2.View()
 	if !strings.Contains(view, "timed out") {
@@ -272,7 +272,7 @@ func TestPickerView_ShowsFooterHint(t *testing.T) {
 }
 
 func TestPickerView_NoModels(t *testing.T) {
-	p := newPicker(80, 24, nil)
+	p := newPicker(80, 24, nil, "")
 	p2, _ := p.Update(modelLoadedMsg{models: nil})
 	view := p2.View()
 	if !strings.Contains(view, "no models") {
@@ -285,14 +285,14 @@ func TestPickerView_NoModels(t *testing.T) {
 // loadedPickerWithFavs returns a loaded picker with the given model IDs
 // pre-marked as favorites.
 func loadedPickerWithFavs(favIDs []string) picker {
-	p := newPicker(120, 40, favIDs)
+	p := newPicker(120, 40, favIDs, "")
 	p, _ = p.Update(modelLoadedMsg{models: pickerModels})
 	return p
 }
 
 func TestPickerFav_PressFAddsToFavorites(t *testing.T) {
 	p := loadedPicker() // cursor at 0 = Claude 3.5 Sonnet
-	p2, cmd := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	p2, cmd := p.Update(tea.KeyPressMsg{Code: 'f', Text: string('f')})
 	if cmd == nil {
 		t.Fatal("expected cmd after f")
 	}
@@ -314,7 +314,7 @@ func TestPickerFav_PressFAgainRemovesFavorite(t *testing.T) {
 	if p.cursor != 0 || len(p.favModels) != 1 {
 		t.Fatalf("precondition failed: cursor=%d favModels=%d", p.cursor, len(p.favModels))
 	}
-	p2, cmd := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	p2, cmd := p.Update(tea.KeyPressMsg{Code: 'f', Text: string('f')})
 	if cmd == nil {
 		t.Fatal("expected cmd")
 	}
@@ -363,7 +363,7 @@ func TestPickerFav_NavigationSkipsIntoFavSection(t *testing.T) {
 		t.Errorf("expected gpt-4o, got %q", id)
 	}
 	// Move down → enters the main filtered list
-	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyDown})
+	p2, _ := p.Update(tea.KeyPressMsg{Code: tea.KeyDown})
 	if p2.cursor != 1 {
 		t.Errorf("expected cursor=1 after down, got %d", p2.cursor)
 	}
@@ -377,7 +377,7 @@ func TestPickerFav_NavigationSkipsIntoFavSection(t *testing.T) {
 func TestPickerFav_EnterSelectsFavorite(t *testing.T) {
 	p := loadedPickerWithFavs([]string{"openai/gpt-4o"})
 	// cursor=0 = the favorite
-	_, cmd := p.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd := p.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if cmd == nil {
 		t.Fatal("expected cmd")
 	}
@@ -404,11 +404,11 @@ func TestPickerFav_StarIndicatorInMainList(t *testing.T) {
 func TestPickerFav_CursorClampedAfterFavRemoval(t *testing.T) {
 	// Start with 2 favorites, cursor at last fav (index 1), remove it.
 	p := loadedPickerWithFavs([]string{"anthropic/claude-3-5-sonnet", "openai/gpt-4o"})
-	p, _ = p.Update(tea.KeyMsg{Type: tea.KeyDown}) // cursor → 1 (gpt-4o fav)
+	p, _ = p.Update(tea.KeyPressMsg{Code: tea.KeyDown}) // cursor → 1 (gpt-4o fav)
 	if p.cursor != 1 {
 		t.Fatalf("precondition: cursor=%d", p.cursor)
 	}
-	p2, _ := p.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}}) // remove gpt-4o
+	p2, _ := p.Update(tea.KeyPressMsg{Code: 'f', Text: string('f')}) // remove gpt-4o
 	// favModels is now 1; cursor must be clamped to valid range
 	total := len(p2.favModels) + len(p2.filtered)
 	if p2.cursor >= total {
@@ -456,6 +456,124 @@ func TestRemoveFav(t *testing.T) {
 	got2 := removeFav(ids, "z")
 	if len(got2) != 3 {
 		t.Errorf("removing non-existent changed length: %v", got2)
+	}
+}
+
+// ── current model ─────────────────────────────────────────────────────────────
+
+func TestSortCurrentModelToTop(t *testing.T) {
+	models := []openrouter.ModelInfo{
+		{ID: "a", Name: "A"},
+		{ID: "b", Name: "B"},
+		{ID: "c", Name: "C"},
+	}
+	sortCurrentModelToTop(models, "b")
+	if models[0].ID != "b" {
+		t.Errorf("expected b at top, got %q", models[0].ID)
+	}
+	if len(models) != 3 {
+		t.Errorf("expected 3 models, got %d", len(models))
+	}
+}
+
+func TestSortCurrentModelToTop_AlreadyAtTop(t *testing.T) {
+	models := []openrouter.ModelInfo{
+		{ID: "a", Name: "A"},
+		{ID: "b", Name: "B"},
+	}
+	sortCurrentModelToTop(models, "a")
+	if models[0].ID != "a" {
+		t.Errorf("expected a at top, got %q", models[0].ID)
+	}
+	if models[1].ID != "b" {
+		t.Errorf("second element should still be b, got %q", models[1].ID)
+	}
+}
+
+func TestSortCurrentModelToTop_EmptyString_Noop(t *testing.T) {
+	models := []openrouter.ModelInfo{
+		{ID: "a", Name: "A"},
+		{ID: "b", Name: "B"},
+	}
+	sortCurrentModelToTop(models, "")
+	if models[0].ID != "a" || models[1].ID != "b" {
+		t.Errorf("empty currentModel should not reorder: %v", models)
+	}
+}
+
+func TestSortCurrentModelToTop_NotFound_Noop(t *testing.T) {
+	models := []openrouter.ModelInfo{
+		{ID: "a", Name: "A"},
+		{ID: "b", Name: "B"},
+	}
+	sortCurrentModelToTop(models, "z")
+	if models[0].ID != "a" || models[1].ID != "b" {
+		t.Errorf("not-found currentModel should not reorder: %v", models)
+	}
+}
+
+func TestCursorForCurrentModel_InMainList(t *testing.T) {
+	filtered := []openrouter.ModelInfo{
+		{ID: "b", Name: "B"}, // sorted to top
+		{ID: "a", Name: "A"},
+	}
+	cursor := cursorForCurrentModel(filtered, nil, "b")
+	if cursor != 0 {
+		t.Errorf("expected cursor 0, got %d", cursor)
+	}
+}
+
+func TestCursorForCurrentModel_InFavSection(t *testing.T) {
+	filtered := []openrouter.ModelInfo{
+		{ID: "a", Name: "A"},
+	}
+	favModels := []openrouter.ModelInfo{
+		{ID: "b", Name: "B"},
+	}
+	cursor := cursorForCurrentModel(filtered, favModels, "b")
+	if cursor != 0 {
+		t.Errorf("expected cursor at fav index 0, got %d", cursor)
+	}
+}
+
+func TestPickerCurrentModel_SortedToTop(t *testing.T) {
+	p := newPicker(120, 30, nil, "openai/gpt-4o")
+	p, _ = p.Update(modelLoadedMsg{models: pickerModels})
+	// Current model should be at index 0 in filtered
+	if p.filtered[0].ID != "openai/gpt-4o" {
+		t.Errorf("expected gpt-4o at top, got %q", p.filtered[0].ID)
+	}
+	// Cursor should point to it (index 0 since no favorites)
+	if p.cursor != 0 {
+		t.Errorf("expected cursor 0, got %d", p.cursor)
+	}
+	// Selected ID should be the current model
+	if p.selectedID() != "openai/gpt-4o" {
+		t.Errorf("expected selected to be gpt-4o, got %q", p.selectedID())
+	}
+}
+
+func TestPickerCurrentModel_ViewShowsIndicator(t *testing.T) {
+	p := newPicker(120, 30, nil, "openai/gpt-4o")
+	p, _ = p.Update(modelLoadedMsg{models: pickerModels})
+	view := p.View()
+	if !strings.Contains(view, "●") {
+		t.Errorf("expected ● current model indicator in view")
+	}
+}
+
+func TestPickerCurrentModel_StaysTopOnFilter(t *testing.T) {
+	p := newPicker(120, 30, nil, "openai/gpt-4o")
+	p, _ = p.Update(modelLoadedMsg{models: pickerModels})
+	// Type "gpt" — should filter to gpt models with current model still on top
+	for _, ch := range "gpt" {
+		p, _ = p.Update(tea.KeyPressMsg{Code: ch, Text: string(ch)})
+	}
+	if len(p.filtered) == 0 {
+		t.Fatal("expected some filtered models")
+	}
+	if p.filtered[0].ID != "openai/gpt-4o" {
+		t.Errorf("expected gpt-4o at top after filter, got %q", p.filtered[0].ID)
 	}
 }
 

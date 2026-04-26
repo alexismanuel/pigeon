@@ -14,7 +14,7 @@ import (
 
 func TestReadFileLines_basic(t *testing.T) {
 	f := writeTempFile(t, "a\nb\nc\nd\ne")
-	lines, hasMore, err := readFileLines(f, 0, 100)
+	lines, hasMore, err := readFileLines(f, 0, 100, readMaxBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestReadFileLines_basic(t *testing.T) {
 func TestReadFileLines_offsetAndLimit(t *testing.T) {
 	f := writeTempFile(t, "a\nb\nc\nd\ne")
 	// skip 1, take 2 → ["b","c"]
-	lines, hasMore, err := readFileLines(f, 1, 2)
+	lines, hasMore, err := readFileLines(f, 1, 2, readMaxBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestReadFileLines_offsetAndLimit(t *testing.T) {
 func TestReadFileLines_longLineTruncated(t *testing.T) {
 	long := strings.Repeat("x", readMaxLineLen+10)
 	f := writeTempFile(t, long)
-	lines, _, err := readFileLines(f, 0, 10)
+	lines, _, err := readFileLines(f, 0, 10, readMaxBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestExecRead_hasMoreHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(result, "truncated") {
+	if !strings.Contains(result, "Showing lines") {
 		t.Errorf("expected truncation hint in result: %q", result)
 	}
 	if !strings.Contains(result, "offset=4") {

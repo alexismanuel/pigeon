@@ -3,15 +3,13 @@
 // the model ID.
 //
 // Model-to-provider routing rules (evaluated in order):
-//  1. Model IDs starting with "claude-" → Anthropic (when registered).
-//  2. Models discovered at ListModels time are stored in a lookup table.
-//  3. Everything else falls through to the first registered default provider
+//  1. Models discovered at ListModels time are stored in a lookup table.
+//  2. Everything else falls through to the first registered default provider
 //     (typically OpenRouter).
 package multi
 
 import (
 	"context"
-	"strings"
 	"sync"
 
 	"pigeon/internal/provider/openrouter"
@@ -126,14 +124,7 @@ func (mp *Provider) resolveClient(model string) ProviderClient {
 		}
 	}
 
-	// 2. Static routing heuristics.
-	if strings.HasPrefix(model, "claude-") {
-		if c := mp.clientByID("anthropic"); c != nil {
-			return c
-		}
-	}
-
-	// 3. Fall back to the default provider.
+	// 2. Fall back to the default provider.
 	if c := mp.clientByID(mp.defaultID); c != nil {
 		return c
 	}

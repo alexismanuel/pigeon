@@ -10,6 +10,7 @@
 //	pigeon.http_get(url, hdrs) → body, err  synchronous HTTP GET
 //	pigeon.json_decode(str)   → table, err  parse JSON
 //	pigeon.json_encode(table) → str, err    encode to JSON
+//	pigeon.session_model()     → str|nil    current session model ID
 //
 // Supported event kinds (EventKind constants):
 //
@@ -99,11 +100,12 @@ type registeredCommand struct {
 
 // Runtime manages all loaded Lua extensions.
 type Runtime struct {
-	mu       sync.Mutex
-	exts     []*extState
-	handlers map[EventKind][]registeredHandler
-	commands map[string]registeredCommand
-	statusCh chan<- StatusUpdate
+	mu             sync.Mutex
+	exts           []*extState
+	handlers       map[EventKind][]registeredHandler
+	commands       map[string]registeredCommand
+	statusCh       chan<- StatusUpdate
+	SessionModelFn func() string // returns current session model, or ""
 }
 
 // NewRuntime creates a Runtime. statusCh receives every set_status call;
@@ -254,6 +256,7 @@ func (r *Runtime) registerAPI(ext *extState) {
 	L.SetField(mod, "http_get", L.NewFunction(apiHttpGet))
 	L.SetField(mod, "json_decode", L.NewFunction(apiJsonDecode))
 	L.SetField(mod, "json_encode", L.NewFunction(apiJsonEncode))
+	L.SetField(mod, "session_model", L.NewFunction(r.apiSessionModel))
 	L.SetGlobal("pigeon", mod)
 }
 
@@ -294,6 +297,17 @@ func (r *Runtime) apiSetStatus(L *glua.LState) int {
 		}
 	}
 	return 0
+}
+
+func (r *Runtime) apiSessionModel(L *glua.LState) int {
+	if r.SessionModelFn != nil {
+		if m := r.SessionModelFn(); m != "" {
+			L.Push(glua.LString(m))
+			return 1
+		}
+	}
+	L.Push(glua.LNil)
+	return 1
 }
 
 // ── standalone API functions ──────────────────────────────────────────────────

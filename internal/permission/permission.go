@@ -128,9 +128,15 @@ type pendingEntry struct {
 	request Request
 }
 
+// ErrSandbox is returned when sandbox mode blocks a request targeting a path
+// outside the allowed sandbox boundaries.
+var ErrSandbox = errors.New("path is outside the sandbox boundary")
+
 type permissionService struct {
 	workingDir       string
 	skip             bool
+	sandbox          bool
+	sandboxDirs      []string // resolved, absolute, clean paths that are always allowed
 	allowedTools     []string
 	bashDenyPatterns []string
 
@@ -160,10 +166,19 @@ type permissionService struct {
 //     are auto-approved without prompting.
 //   - bashDenyPatterns is a list of glob patterns matched against bash commands.
 //     Matching commands are auto-denied without prompting.
-func NewService(workingDir string, skip bool, allowedTools []string, bashDenyPatterns []string) Service {
+//   - sandboxMode restricts write/edit to workingDir + pigeon config dirs.
+//     Paths outside the sandbox always require interactive approval.
+func NewService(workingDir string, skip bool, allowedTools []string, bashDenyPatterns []string, sandboxMode bool) Service {
+	wd := filepath.Clean(workingDir)
+	sandboxDirs := []string{wd}
+	if sandboxMode {
+		sandboxDirs = computeSandboxDirs(wd)
+	}
 	return &permissionService{
-		workingDir:       workingDir,
+		workingDir:       wd,
 		skip:             skip,
+		sandbox:          sandboxMode,
+		sandboxDirs:      sandboxDirs,
 		allowedTools:     allowedTools,
 		bashDenyPatterns: bashDenyPatterns,
 		requestCh:        make(chan Request, 1),
@@ -192,10 +207,24 @@ func (s *permissionService) Request(ctx context.Context, opts CreatePermissionRe
 		}
 	}
 
+	// ── 2b. sandbox boundary ──────────────────────────────────────────────────
+	// When sandbox mode is active, write/edit targeting paths outside the
+	// sandbox must always prompt the user, regardless of the allowlist.
+	outsideSandbox := false
+	if s.sandbox && (opts.ToolName == "write" || opts.ToolName == "edit") {
+		resolved := s.resolveDir(opts.Path)
+		if !isWithinSandbox(resolved, s.sandboxDirs) {
+			outsideSandbox = true
+		}
+	}
+
 	// ── 3. allowlist ──────────────────────────────────────────────────────────
-	toolKey := opts.ToolName + ":" + opts.Action
-	if slices.Contains(s.allowedTools, opts.ToolName) || slices.Contains(s.allowedTools, toolKey) {
-		return true, nil
+	// Skip allowlist for out-of-sandbox write/edit — must always prompt.
+	if !outsideSandbox {
+		toolKey := opts.ToolName + ":" + opts.Action
+		if slices.Contains(s.allowedTools, opts.ToolName) || slices.Contains(s.allowedTools, toolKey) {
+			return true, nil
+		}
 	}
 
 	// ── 4. session-level auto-approval ────────────────────────────────────────
@@ -371,6 +400,40 @@ func matchesDenyPattern(cmd string, patterns []string) string {
 		}
 	}
 	return ""
+}
+
+// computeSandboxDirs returns the list of absolute directory paths that are
+// considered "inside the sandbox" when sandbox mode is enabled.  This includes
+// the working directory plus pigeon configuration directories.
+func computeSandboxDirs(workingDir string) []string {
+	dirs := []string{filepath.Clean(workingDir)}
+
+	// ~/.config/pigeon/
+	if configDir, err := os.UserConfigDir(); err == nil {
+		dirs = append(dirs, filepath.Join(configDir, "pigeon"))
+	}
+
+	// ~/.pigeon/  (sessions, etc.)
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".pigeon"))
+	}
+
+	// .pigeon/ relative to working dir (project-local config)
+	dirs = append(dirs, filepath.Join(workingDir, ".pigeon"))
+
+	return dirs
+}
+
+// isWithinSandbox returns true if the given path is contained within (or
+// equal to) one of the sandbox directories.
+func isWithinSandbox(path string, sandboxDirs []string) bool {
+	clean := filepath.Clean(path)
+	for _, dir := range sandboxDirs {
+		if clean == dir || strings.HasPrefix(clean, dir+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // newID generates a random request ID (UUID-ish, using crypto/rand).

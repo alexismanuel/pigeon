@@ -22,6 +22,13 @@ type Message struct {
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	Name       string     `json:"name,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	// ReasoningContent holds chain-of-thought tokens from reasoning models
+	// (DeepSeek-R1, QwQ, etc.). Persisted in session JSONL but not sent to
+	// the API as a separate field — providers deliver it via streaming deltas.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	// StopReason indicates why the assistant stopped generating.
+	// "complete" (default), "cancelled", "error".
+	StopReason string `json:"stop_reason,omitempty"`
 	// Usage is populated by the provider after a streaming completion finishes.
 	// It is NOT serialised to JSON (omitempty on a struct won't help, but the
 	// field is never sent as part of outgoing messages).
@@ -75,6 +82,7 @@ type ModelInfo struct {
 	// Provider identifies the originating provider (e.g. "openrouter",
 	// "anthropic", "lmstudio"). Set by the multi-provider catalog.
 	Provider string
+
 }
 
 type Client struct {
@@ -107,6 +115,7 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "pigeon")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -189,6 +198,7 @@ func (c *Client) StreamChatCompletion(
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "pigeon")
 	if c.appName != "" {
 		req.Header.Set("X-Title", c.appName)
 	}
